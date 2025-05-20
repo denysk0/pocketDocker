@@ -1,0 +1,77 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+
+# Go build artifacts
+bin/
+_build/
+pkg/
+
+# Go modules
+/go.sum
+/go.mod
+vendor/
+
+# SQLite database file (если используешь локально)
+*.db
+*.sqlite
+*.sqlite3
+
+# PocketDocker metadata & logs
+data/ 
+logs/
+~/.mini-docker/images/  # если по ошибке попало внутрь репо
+
+# Environment variables
+.env
+.env.*
+
+# Docker overrides
+docker-compose.override.yml
+
+# IDE / editor
+.idea/
+.vscode/
+*.iml
+*.code-workspace
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Temporary / backup files
+*~
+*.bak
+*.swp
+*.swo
+*.old
+*.orig
+*.tmp
+*.temp
+*.seed
+
+# Logs & pid files
+*.log
+*.pid
+
+# Test & coverage
+coverage.out
+htmlcov/
+.coverage
+.pytest_cache/
+junit-xml/
+test-results.xml
+
+# Lint / tool caches
+*.cache
+.mypy_cache/
