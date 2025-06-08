@@ -28,9 +28,9 @@ var PsCmd = &cobra.Command{
 			return
 		}
 		tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(tw, "ID\tNAME\tIMAGE\tSTATE\tSTARTED")
+		fmt.Fprintln(tw, "ID\tNAME\tIMAGE\tSTATE\tSTARTED\tRESTARTS")
 		for _, c := range list {
-			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", c.ID, c.Name, c.Image, c.State, c.StartedAt.Format(time.RFC3339))
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%d\n", c.ID, c.Name, c.Image, c.State, c.StartedAt.Format(time.RFC3339), c.RestartCount)
 		}
 		tw.Flush()
 	},

@@ -19,7 +19,7 @@ func TestStoreCRUD(t *testing.T) {
 	if err := s.Init(); err != nil {
 		t.Fatal(err)
 	}
-	info := ContainerInfo{ID: "1", Name: "n", Image: "img", PID: 123, State: "Running", StartedAt: time.Now()}
+	info := ContainerInfo{ID: "1", Name: "n", Image: "img", PID: 123, State: "Running", StartedAt: time.Now(), RestartMax: 0}
 	if err := s.SaveContainer(info); err != nil {
 		t.Fatalf("save: %v", err)
 	}

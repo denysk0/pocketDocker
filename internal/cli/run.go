@@ -1,11 +1,15 @@
 package cli
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"io"
+	"github.com/denysk0/pocketDocker/internal/logging"
+	"github.com/denysk0/pocketDocker/internal/runtime"
+	"github.com/denysk0/pocketDocker/internal/runtime/cgroups"
 	"github.com/mattn/go-shellwords"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,18 +17,55 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/denysk0/pocketDocker/internal/logging"
-	"github.com/denysk0/pocketDocker/internal/runtime"
-	"github.com/denysk0/pocketDocker/internal/runtime/cgroups"
 	"github.com/denysk0/pocketDocker/internal/store"
 	"github.com/spf13/cobra"
 )
 
+func prepareRootfs(src string) (string, error) {
+	dir, err := os.MkdirTemp("", "pocketdocker-rootfs-")
+	if err != nil {
+		return "", err
+	}
+	fi, err := os.Stat(src)
+	if err != nil {
+		return "", err
+	}
+	if fi.IsDir() {
+		cmd1 := exec.Command("tar", "-cC", src, ".")
+		cmd2 := exec.Command("tar", "-xC", dir)
+		r, w := io.Pipe()
+		cmd1.Stdout = w
+		cmd2.Stdin = r
+		cmd1.Stderr = os.Stderr
+		cmd2.Stderr = os.Stderr
+		if err := cmd1.Start(); err != nil {
+			return "", err
+		}
+		if err := cmd2.Start(); err != nil {
+			return "", err
+		}
+		_ = cmd1.Wait()
+		w.Close()
+		_ = cmd2.Wait()
+	} else {
+		tarCmd := exec.Command("tar", "-xf", src, "-C", dir)
+		tarCmd.Stdout = os.Stdout
+		tarCmd.Stderr = os.Stderr
+		if err := tarCmd.Run(); err != nil {
+			return "", err
+		}
+	}
+	return dir, nil
+}
+
 var (
-	rootfs      string
-	command     string
-	memoryLimit int64
-	cpuShares   int64
+	rootfs         string
+	command        string
+	memoryLimit    int64
+	cpuShares      int64
+	healthCmd      string
+	healthInterval int
+	restartMax     int
 )
 
 // RunCmd runs a container
@@ -55,116 +96,126 @@ var RunCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		rootfsDir, err := os.MkdirTemp("", "pocketdocker-rootfs-")
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		// do not defer os.RemoveAll(rootfsDir)
-
 		idBytes := make([]byte, 16)
 		rand.Read(idBytes)
 		id := hex.EncodeToString(idBytes)
 
-		fi, _ := os.Stat(rootfs)
-		if fi.IsDir() {
-			// copy dir using tar pipe to preserve permissions
-			cmd1 := exec.Command("tar", "-cC", rootfs, ".")
-			cmd2 := exec.Command("tar", "-xC", rootfsDir)
-			r, w := io.Pipe()
-			cmd1.Stdout = w
-			cmd2.Stdin = r
-			cmd1.Stderr = os.Stderr
-			cmd2.Stderr = os.Stderr
-			if err := cmd1.Start(); err != nil {
-				fmt.Fprintf(os.Stderr, "copy rootfs: %v\n", err)
-				os.Exit(1)
-			}
-			if err := cmd2.Start(); err != nil {
-				fmt.Fprintf(os.Stderr, "copy rootfs: %v\n", err)
-				os.Exit(1)
-			}
-			_ = cmd1.Wait()
-			w.Close()
-			_ = cmd2.Wait()
-		} else {
-			tarCmd := exec.Command("tar", "-xf", rootfs, "-C", rootfsDir)
-			tarCmd.Stdout = os.Stdout
-			tarCmd.Stderr = os.Stderr
-			if err := tarCmd.Run(); err != nil {
-				fmt.Fprintf(os.Stderr, "failed to extract rootfs: %v\n", err)
-				os.Exit(1)
-			}
-		}
-
 		parser := shellwords.NewParser()
 		parts, err := parser.Parse(command)
+
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+
 		binary := parts[0]
 		if !strings.Contains(binary, "/") {
 			binary = "/bin/" + binary
 		}
-		pid, master, err := runtime.CloneAndRun(binary, parts[1:], rootfsDir)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to run command: %v\n", err)
-			os.Exit(1)
-		}
-		if master != nil {
-			var errAttach error
-			pr, errAttach = logging.Attach(id, master)
-			if errAttach != nil {
-				fmt.Fprintf(os.Stderr, "failed to attach logs: %v\n", errAttach)
-			}
-		}
-
-		if memoryLimit > 0 {
-			if err := cgroups.ApplyMemoryLimit(id, pid, memoryLimit); err != nil {
-				fmt.Fprintf(os.Stderr, "failed to apply memory limit: %v\n", err)
-				os.Exit(1)
-			}
-		}
-		if cpuShares > 0 {
-			if err := cgroups.ApplyCPUShares(id, pid, cpuShares); err != nil {
-				fmt.Fprintf(os.Stderr, "failed to apply CPU shares: %v\n", err)
-				os.Exit(1)
-			}
-		}
-
 		name := strings.TrimSuffix(filepath.Base(rootfs), filepath.Ext(rootfs))
-		info := store.ContainerInfo{
-			ID:        id,
-			Name:      name,
-			Image:     rootfs,
-			PID:       pid,
-			State:     "Running",
-			StartedAt: time.Now().UTC(),
-			RootfsDir: rootfsDir,
-		}
-		if st := getStore(); st != nil {
-			if err := st.SaveContainer(info); err != nil {
-				fmt.Fprintf(os.Stderr, "failed to save container metadata: %v\n", err)
+
+		restartCount := 0
+		printedID := false
+		for {
+			rootfsDir, err := prepareRootfs(rootfs)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
 			}
+
+			pid, master, err := runtime.CloneAndRun(binary, parts[1:], rootfsDir)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to run command: %v\n", err)
+				os.Exit(1)
+			}
+			if master != nil {
+				var errAttach error
+				pr, errAttach = logging.Attach(id, master)
+				if errAttach != nil {
+					fmt.Fprintf(os.Stderr, "failed to attach logs: %v\n", errAttach)
+				}
+			}
+
+			if memoryLimit > 0 {
+				if err := cgroups.ApplyMemoryLimit(id, pid, memoryLimit); err != nil {
+					fmt.Fprintf(os.Stderr, "failed to apply memory limit: %v\n", err)
+					os.Exit(1)
+				}
+			}
+			if cpuShares > 0 {
+				if err := cgroups.ApplyCPUShares(id, pid, cpuShares); err != nil {
+					fmt.Fprintf(os.Stderr, "failed to apply CPU shares: %v\n", err)
+					os.Exit(1)
+				}
+			}
+
+			info := store.ContainerInfo{
+				ID:             id,
+				Name:           name,
+				Image:          rootfs,
+				PID:            pid,
+				State:          "Running",
+				StartedAt:      time.Now().UTC(),
+				RootfsDir:      rootfsDir,
+				RestartCount:   restartCount,
+				HealthCmd:      healthCmd,
+				HealthInterval: healthInterval,
+				RestartMax:     restartMax,
+			}
+			st := getStore()
+			if st != nil {
+				_ = st.SaveContainer(info)
+			}
+			if !printedID {
+				fmt.Println(id)
+				printedID = true
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			failCh := make(chan struct{}, 1)
+			interval := time.Duration(healthInterval) * time.Second
+			if interval <= 0 {
+				interval = 30 * time.Second
+			}
+			runtime.StartWatchdog(ctx, pid, interval, healthCmd, failCh)
+
+			exitCh := make(chan struct{})
+			go func() {
+				var ws syscall.WaitStatus
+				syscall.Wait4(pid, &ws, 0, nil)
+				close(exitCh)
+			}()
+
+			// Wait for either a health-check failure or process exit
+			select {
+			case <-failCh:
+				logging.Append(id, "FAILED health-check")
+			case <-exitCh:
+				// container exited (normal or error), treat as failure if under restart limit
+				if restartMax == 0 || restartCount < restartMax {
+					logging.Append(id, "FAILED health-check")
+				}
+			}
+
+			cancel()
+			runtime.Cleanup(info)
+			if pr != nil {
+				_, _ = io.Copy(io.Discard, pr)
+				pr.Close()
+				pr = nil
+			}
+
+			if restartMax > 0 && restartCount >= restartMax {
+				if st != nil {
+					info.State = "Stopped"
+					st.SaveContainer(info)
+				}
+				return
+			}
+
+			restartCount++
+			logging.Append(id, fmt.Sprintf("Restart #%d ...", restartCount))
 		}
-
-		fmt.Println(id)
-
-		// Wait for container process to exit so logs are fully captured
-		var ws syscall.WaitStatus
-		_, _ = syscall.Wait4(pid, &ws, 0, nil)
-
-		// After exit, close the masterPTY to signal logging.Attach to finish
-		if master != nil {
-			master.Close()
-		}
-
-		// Drain the log pipe to ensure all log data is written
-		if pr != nil {
-			_, _ = io.Copy(io.Discard, pr)
-			pr.Close()
-		}
-
-		// Return to allow cobra to exit naturally
-		return
 	},
 }
 
@@ -173,6 +224,9 @@ func init() {
 	RunCmd.Flags().StringVar(&command, "cmd", "", "command to run inside container (e.g. \"/bin/sh\")")
 	RunCmd.Flags().Int64Var(&memoryLimit, "memory", 0, "memory limit in bytes (e.g. 104857600 for 100 MB)")
 	RunCmd.Flags().Int64Var(&cpuShares, "cpu-shares", 0, "CPU weight 1–10000 (100 = default)")
+	RunCmd.Flags().StringVar(&healthCmd, "health-cmd", "", "health check command")
+	RunCmd.Flags().IntVar(&healthInterval, "health-interval", 30, "health check interval seconds")
+	RunCmd.Flags().IntVar(&restartMax, "restart-max", 0, "max restarts (0 = unlimited)")
 	err := RunCmd.MarkFlagRequired("rootfs")
 	if err != nil {
 		return

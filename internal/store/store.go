@@ -8,13 +8,17 @@ import (
 )
 
 type ContainerInfo struct {
-	ID        string
-	Name      string
-	Image     string
-	PID       int
-	State     string
-	StartedAt time.Time
-	RootfsDir string
+	ID             string
+	Name           string
+	Image          string
+	PID            int
+	State          string
+	StartedAt      time.Time
+	RootfsDir      string
+	RestartCount   int
+	HealthCmd      string
+	HealthInterval int
+	RestartMax     int
 }
 
 type Store struct {
@@ -37,7 +41,11 @@ func (s *Store) Init() error {
         pid INTEGER,
         state TEXT,
         started_at TEXT,
-        rootfs_dir TEXT
+        rootfs_dir TEXT,
+        restart_count INTEGER DEFAULT 0,
+        health_cmd TEXT,
+        health_interval INTEGER DEFAULT 0,
+        restart_max INTEGER DEFAULT 0
     )`)
 
 	if err != nil {
@@ -56,7 +64,7 @@ func (s *Store) Init() error {
 	if err != nil {
 		return err
 	}
-	found := false
+	cols := map[string]bool{}
 	for rows.Next() {
 		var cid int
 		var name, ctype string
@@ -66,14 +74,31 @@ func (s *Store) Init() error {
 			rows.Close()
 			return err
 		}
-		if name == "rootfs_dir" {
-			found = true
-			break
-		}
+		cols[name] = true
 	}
 	rows.Close()
-	if !found {
+	if !cols["rootfs_dir"] {
 		if _, err := s.db.Exec("ALTER TABLE containers ADD COLUMN rootfs_dir TEXT"); err != nil {
+			return err
+		}
+	}
+	if !cols["restart_count"] {
+		if _, err := s.db.Exec("ALTER TABLE containers ADD COLUMN restart_count INTEGER DEFAULT 0"); err != nil {
+			return err
+		}
+	}
+	if !cols["health_cmd"] {
+		if _, err := s.db.Exec("ALTER TABLE containers ADD COLUMN health_cmd TEXT"); err != nil {
+			return err
+		}
+	}
+	if !cols["health_interval"] {
+		if _, err := s.db.Exec("ALTER TABLE containers ADD COLUMN health_interval INTEGER DEFAULT 0"); err != nil {
+			return err
+		}
+	}
+	if !cols["restart_max"] {
+		if _, err := s.db.Exec("ALTER TABLE containers ADD COLUMN restart_max INTEGER DEFAULT 0"); err != nil {
 			return err
 		}
 	}
@@ -87,15 +112,15 @@ func (s *Store) Init() error {
 }
 
 func (s *Store) SaveContainer(c ContainerInfo) error {
-	_, err := s.db.Exec(`INSERT INTO containers(id, name, image, pid, state, started_at, rootfs_dir)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET name=excluded.name,image=excluded.image,pid=excluded.pid,state=excluded.state,started_at=excluded.started_at,rootfs_dir=excluded.rootfs_dir`,
-		c.ID, c.Name, c.Image, c.PID, c.State, c.StartedAt.Format(time.RFC3339), c.RootfsDir)
+	_, err := s.db.Exec(`INSERT INTO containers(id, name, image, pid, state, started_at, rootfs_dir, restart_count, health_cmd, health_interval, restart_max)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET name=excluded.name,image=excluded.image,pid=excluded.pid,state=excluded.state,started_at=excluded.started_at,rootfs_dir=excluded.rootfs_dir,restart_count=excluded.restart_count,health_cmd=excluded.health_cmd,health_interval=excluded.health_interval,restart_max=excluded.restart_max`,
+		c.ID, c.Name, c.Image, c.PID, c.State, c.StartedAt.Format(time.RFC3339), c.RootfsDir, c.RestartCount, c.HealthCmd, c.HealthInterval, c.RestartMax)
 	return err
 }
 
 func (s *Store) ListContainers() ([]ContainerInfo, error) {
-	rows, err := s.db.Query(`SELECT id, name, image, pid, state, started_at, rootfs_dir FROM containers`)
+	rows, err := s.db.Query(`SELECT id, name, image, pid, state, started_at, rootfs_dir, restart_count, COALESCE(health_cmd, ''), health_interval, restart_max FROM containers`)
 	if err != nil {
 		return nil, err
 	}
@@ -104,7 +129,7 @@ func (s *Store) ListContainers() ([]ContainerInfo, error) {
 	for rows.Next() {
 		var c ContainerInfo
 		var t, rootfsDir string
-		if err := rows.Scan(&c.ID, &c.Name, &c.Image, &c.PID, &c.State, &t, &rootfsDir); err != nil {
+		if err := rows.Scan(&c.ID, &c.Name, &c.Image, &c.PID, &c.State, &t, &rootfsDir, &c.RestartCount, &c.HealthCmd, &c.HealthInterval, &c.RestartMax); err != nil {
 			return nil, err
 		}
 		c.StartedAt, _ = time.Parse(time.RFC3339, t)
@@ -115,10 +140,10 @@ func (s *Store) ListContainers() ([]ContainerInfo, error) {
 }
 
 func (s *Store) GetContainer(id string) (ContainerInfo, error) {
-	row := s.db.QueryRow(`SELECT id, name, image, pid, state, started_at, rootfs_dir FROM containers WHERE id = ?`, id)
+	row := s.db.QueryRow(`SELECT id, name, image, pid, state, started_at, rootfs_dir, restart_count, COALESCE(health_cmd, ''), health_interval, restart_max FROM containers WHERE id = ?`, id)
 	var c ContainerInfo
 	var t, rootfsDir string
-	if err := row.Scan(&c.ID, &c.Name, &c.Image, &c.PID, &c.State, &t, &rootfsDir); err != nil {
+	if err := row.Scan(&c.ID, &c.Name, &c.Image, &c.PID, &c.State, &t, &rootfsDir, &c.RestartCount, &c.HealthCmd, &c.HealthInterval, &c.RestartMax); err != nil {
 		return ContainerInfo{}, err
 	}
 	c.StartedAt, _ = time.Parse(time.RFC3339, t)
@@ -133,6 +158,11 @@ func (s *Store) DeleteContainer(id string) error {
 
 func (s *Store) UpdateContainerState(id, state string) error {
 	_, err := s.db.Exec(`UPDATE containers SET state = ? WHERE id = ?`, state, id)
+	return err
+}
+
+func (s *Store) UpdateContainerPID(id string, pid int) error {
+	_, err := s.db.Exec(`UPDATE containers SET pid = ? WHERE id = ?`, pid, id)
 	return err
 }
 
