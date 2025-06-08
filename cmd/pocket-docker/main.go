@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	// "github.com/denysk0/pocketDocker"
 	"github.com/denysk0/pocketDocker/internal/cli"
 	"github.com/spf13/cobra"
 	"os"

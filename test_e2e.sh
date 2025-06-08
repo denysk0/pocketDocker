@@ -19,8 +19,12 @@ else
   echo "Процесс $CONTAINER_PID изолирован."
 fi
 
-# Заходим внутрь контейнера и проверяем /proc
-nsenter --target "$CONTAINER_PID" --pid --mount ls /proc/1
+if command -v nsenter >/dev/null 2>&1; then
+  # Заходим внутрь контейнера и проверяем /proc
+  nsenter --target "$CONTAINER_PID" --pid --mount ls /proc/1
+else
+  echo "nsenter not found, skipping nsenter check"
+fi
 
 # Убиваем контейнер
 kill "$CONTAINER_PID"
