@@ -39,12 +39,23 @@ func (s *Store) Init() error {
         started_at TEXT,
         rootfs_dir TEXT
     )`)
-	
+
+	if err != nil {
+		return err
+	}
+
+	if _, err = s.db.Exec(`CREATE TABLE IF NOT EXISTS images (
+        name TEXT PRIMARY KEY,
+        path TEXT,
+        created_at TEXT
+    )`); err != nil {
+		return err
+	}
+
 	rows, err := s.db.Query("PRAGMA table_info(containers)")
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
 	found := false
 	for rows.Next() {
 		var cid int
@@ -52,6 +63,7 @@ func (s *Store) Init() error {
 		var notnull, pk int
 		var dfltValue sql.NullString
 		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err != nil {
+			rows.Close()
 			return err
 		}
 		if name == "rootfs_dir" {
@@ -59,13 +71,11 @@ func (s *Store) Init() error {
 			break
 		}
 	}
+	rows.Close()
 	if !found {
 		if _, err := s.db.Exec("ALTER TABLE containers ADD COLUMN rootfs_dir TEXT"); err != nil {
 			return err
 		}
-	}
-	if err != nil {
-		return err
 	}
 	if _, err = s.db.Exec("PRAGMA journal_mode = WAL;"); err != nil {
 		return err

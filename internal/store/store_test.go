@@ -44,4 +44,16 @@ func TestStoreCRUD(t *testing.T) {
 	if err != nil || len(list) != 0 {
 		t.Fatalf("delete check failed")
 	}
+	
+	img := ImageInfo{Name: "busybox", Path: "/tmp/busybox", CreatedAt: time.Now()}
+	if err := s.SaveImage(img); err != nil {
+		t.Fatalf("save image: %v", err)
+	}
+	if _, err := s.GetImage("busybox"); err != nil {
+		t.Fatalf("get image: %v", err)
+	}
+	imgs, err := s.ListImages()
+	if err != nil || len(imgs) != 1 {
+		t.Fatalf("list images failed")
+	}
 }

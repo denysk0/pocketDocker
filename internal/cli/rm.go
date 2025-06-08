@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 )
@@ -46,6 +47,8 @@ var RmCmd = &cobra.Command{
 		}
 
 		for _, id := range ids {
+			// Trim any whitespace around the ID
+			id = strings.TrimSpace(id)
 			if err := st.DeleteContainer(id); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to remove container %s: %v\n", id, err)
 				continue

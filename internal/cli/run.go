@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,6 +34,23 @@ var RunCmd = &cobra.Command{
 			fmt.Fprintln(os.Stderr, "both --rootfs and --cmd flags are required")
 			os.Exit(1)
 		}
+		// if rootfs is just a name, try lookup in image cache
+		if !strings.Contains(rootfs, "/") && !strings.HasSuffix(rootfs, ".tar") {
+			if st := getStore(); st != nil {
+				if img, err := st.GetImage(rootfs); err == nil {
+					rootfs = img.Path
+				}
+			}
+		}
+		if _, err := os.Stat(rootfs); os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "image or file %s not found (did you run `pull`?)\n", rootfs)
+			os.Exit(1)
+		}
+
+		if _, err := exec.LookPath("tar"); err != nil {
+			fmt.Fprintln(os.Stderr, "tar command not found in PATH")
+			os.Exit(1)
+		}
 
 		rootfsDir, err := os.MkdirTemp("", "pocketdocker-rootfs-")
 		if err != nil {
@@ -41,42 +59,66 @@ var RunCmd = &cobra.Command{
 		}
 		// do not defer os.RemoveAll(rootfsDir)
 
-		tarCmd := exec.Command("tar", "-xf", rootfs, "-C", rootfsDir)
-		tarCmd.Stdout = os.Stdout
-		tarCmd.Stderr = os.Stderr
-		if err := tarCmd.Run(); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to extract rootfs: %v\n", err)
-			os.Exit(1)
+		idBytes := make([]byte, 16)
+		rand.Read(idBytes)
+		id := hex.EncodeToString(idBytes)
+
+		fi, _ := os.Stat(rootfs)
+		if fi.IsDir() {
+			// copy dir using tar pipe to preserve permissions
+			cmd1 := exec.Command("tar", "-cC", rootfs, ".")
+			cmd2 := exec.Command("tar", "-xC", rootfsDir)
+			r, w := io.Pipe()
+			cmd1.Stdout = w
+			cmd2.Stdin = r
+			cmd1.Stderr = os.Stderr
+			cmd2.Stderr = os.Stderr
+			if err := cmd1.Start(); err != nil {
+				fmt.Fprintf(os.Stderr, "copy rootfs: %v\n", err)
+				os.Exit(1)
+			}
+			if err := cmd2.Start(); err != nil {
+				fmt.Fprintf(os.Stderr, "copy rootfs: %v\n", err)
+				os.Exit(1)
+			}
+			_ = cmd1.Wait()
+			w.Close()
+			_ = cmd2.Wait()
+		} else {
+			tarCmd := exec.Command("tar", "-xf", rootfs, "-C", rootfsDir)
+			tarCmd.Stdout = os.Stdout
+			tarCmd.Stderr = os.Stderr
+			if err := tarCmd.Run(); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to extract rootfs: %v\n", err)
+				os.Exit(1)
+			}
 		}
 
 		parser := shellwords.NewParser()
 		parts, err := parser.Parse(command)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to parse command: %v\n", err)
-			os.Exit(1)
+		binary := parts[0]
+		if !strings.Contains(binary, "/") {
+			binary = "/bin/" + binary
 		}
-		pid, err := runtime.CloneAndRun(parts[0], parts[1:], rootfsDir)
+		pid, err := runtime.CloneAndRun(binary, parts[1:], rootfsDir)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
+			fmt.Fprintf(os.Stderr, "failed to run command: %v\n", err)
 			os.Exit(1)
 		}
 
 		if memoryLimit > 0 {
-			if err := cgroups.ApplyMemoryLimit(fmt.Sprint(pid), pid, memoryLimit); err != nil {
+			if err := cgroups.ApplyMemoryLimit(id, pid, memoryLimit); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to apply memory limit: %v\n", err)
 				os.Exit(1)
 			}
 		}
 		if cpuShares > 0 {
-			if err := cgroups.ApplyCPUShares(fmt.Sprint(pid), pid, cpuShares); err != nil {
+			if err := cgroups.ApplyCPUShares(id, pid, cpuShares); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to apply CPU shares: %v\n", err)
 				os.Exit(1)
 			}
 		}
 
-		idBytes := make([]byte, 16)
-		rand.Read(idBytes)
-		id := hex.EncodeToString(idBytes)
 		name := strings.TrimSuffix(filepath.Base(rootfs), filepath.Ext(rootfs))
 		info := store.ContainerInfo{
 			ID:        id,

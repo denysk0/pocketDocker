@@ -6,6 +6,7 @@ import (
 	"github.com/spf13/cobra"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -48,6 +49,8 @@ var StopCmd = &cobra.Command{
 			return
 		}
 		for _, id := range ids {
+			// Trim any whitespace around the ID
+			id = strings.TrimSpace(id)
 			info, err := st.GetContainer(id)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "unknown container")
