@@ -13,7 +13,6 @@ pkg/
 /pocket-docker
 
 # Go modules
-/go.sum
 vendor/
 
 # SQLite database file (если используешь локально)

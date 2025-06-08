@@ -1,13 +1,19 @@
 package cli
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/denysk0/pocketDocker/internal/runtime"
 	"github.com/denysk0/pocketDocker/internal/runtime/cgroups"
+	"github.com/denysk0/pocketDocker/internal/store"
+	"github.com/mattn/go-shellwords"
 	"github.com/spf13/cobra"
 )
 
@@ -43,14 +49,18 @@ var RunCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		parts := strings.Fields(command)
+		parser := shellwords.NewParser()
+		parts, err := parser.Parse(command)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to parse command: %v\n", err)
+			os.Exit(1)
+		}
 		pid, err := runtime.CloneAndRun(parts[0], parts[1:], rootfsDir)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
 
-		// Apply resource limits and handle errors
 		if memoryLimit > 0 {
 			if err := cgroups.ApplyMemoryLimit(fmt.Sprint(pid), pid, memoryLimit); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to apply memory limit: %v\n", err)
@@ -64,7 +74,27 @@ var RunCmd = &cobra.Command{
 			}
 		}
 
-		fmt.Println(pid)
+		idBytes := make([]byte, 16)
+		rand.Read(idBytes)
+		id := hex.EncodeToString(idBytes)
+		name := strings.TrimSuffix(filepath.Base(rootfs), filepath.Ext(rootfs))
+		info := store.ContainerInfo{
+			ID:        id,
+			Name:      name,
+			Image:     rootfs,
+			PID:       pid,
+			State:     "Running",
+			StartedAt: time.Now().UTC(),
+			RootfsDir: rootfsDir,
+		}
+		if st := getStore(); st != nil {
+			if err := st.SaveContainer(info); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to save container metadata: %v\n", err)
+				os.Exit(1)
+			}
+		}
+
+		fmt.Println(id)
 		os.Exit(0)
 	},
 }

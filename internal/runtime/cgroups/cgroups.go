@@ -2,11 +2,11 @@ package cgroups
 
 import (
 	"bufio"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"log"
 	"syscall"
 	"time"
 )
@@ -44,7 +44,7 @@ func ApplyMemoryLimit(containerID string, pid int, limitBytes int64) error {
 	return nil
 }
 
-// ApplyCPUShares sets CPU weight for containerID cgroup.
+// ApplyCPUShares sets CPU weight for containerID cgroup
 func ApplyCPUShares(containerID string, pid int, shares int64) error {
 	dir, err := ensureCgroupDir(containerID)
 	if err != nil {
@@ -59,7 +59,7 @@ func ApplyCPUShares(containerID string, pid int, shares int64) error {
 	return nil
 }
 
-// RemoveCgroup removes cgroup directory for given containerID.
+// RemoveCgroup removes cgroup directory for given containerID
 func RemoveCgroup(containerID string) error {
 	dir := filepath.Join(CgroupRoot, containerID)
 	return os.RemoveAll(dir)
