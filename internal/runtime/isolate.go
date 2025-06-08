@@ -43,10 +43,14 @@ func SetupContainerRoot(rootfsPath string) error {
 	}
 
 	if err := syscall.Mount("proc", "/proc", "proc", 0, ""); err != nil {
-		return fmt.Errorf("mount proc failed: %w", err)
+		if err != syscall.EPERM {
+			return fmt.Errorf("mount proc failed: %w", err)
+		}
 	}
 	if err := syscall.Mount("sysfs", "/sys", "sysfs", 0, ""); err != nil {
-		return fmt.Errorf("mount sysfs failed: %w", err)
+		if err != syscall.EPERM {
+			return fmt.Errorf("mount sysfs failed: %w", err)
+		}
 	}
 
 	return nil
@@ -59,7 +63,7 @@ func CloneAndRun(cmdPath string, args []string, rootfsPath string) (int, *os.Fil
 	if err != nil {
 		return 0, nil, err
 	}
-	flags := uintptr(syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWNET | syscall.SIGCHLD)
+	flags := uintptr(syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWNET | syscall.CLONE_NEWUSER | syscall.SIGCHLD)
 	pid, _, errno := syscall.RawSyscall(syscall.SYS_CLONE, flags, 0, 0)
 	if errno != 0 {
 		master.Close()
@@ -80,6 +84,21 @@ func CloneAndRun(cmdPath string, args []string, rootfsPath string) (int, *os.Fil
 			fmt.Fprintf(os.Stderr, "exec failed: %v\n", err)
 			os.Exit(1)
 		}
+	}
+	uid := os.Getuid()
+	gid := os.Getgid()
+	uidMap := fmt.Sprintf("0 %d 1\n", uid)
+	gidMap := fmt.Sprintf("0 %d 1\n", gid)
+	if err := os.WriteFile(fmt.Sprintf("/proc/%d/uid_map", pid), []byte(uidMap), 0644); err != nil {
+		master.Close()
+		slave.Close()
+		return 0, nil, err
+	}
+	_ = os.WriteFile(fmt.Sprintf("/proc/%d/setgroups", pid), []byte("deny"), 0644)
+	if err := os.WriteFile(fmt.Sprintf("/proc/%d/gid_map", pid), []byte(gidMap), 0644); err != nil {
+		master.Close()
+		slave.Close()
+		return 0, nil, err
 	}
 	slave.Close()
 	return int(pid), master, nil

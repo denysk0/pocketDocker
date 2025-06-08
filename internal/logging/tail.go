@@ -62,8 +62,10 @@ func Attach(id string, r io.Reader) (io.ReadCloser, error) {
 }
 
 func userHomeDir() string {
-	sudo := os.Getenv("SUDO_USER")
-	if sudo != "" {
+	if home := os.Getenv("HOME"); home != "" {
+		return home
+	}
+	if sudo := os.Getenv("SUDO_USER"); sudo != "" {
 		if u, err := user.Lookup(sudo); err == nil {
 			return u.HomeDir
 		}

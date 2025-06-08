@@ -30,11 +30,13 @@ func NewLogsCmd() *cobra.Command {
 var LogsCmd = NewLogsCmd()
 
 func logsRun(cmd *cobra.Command, args []string) {
+	out := cmd.OutOrStdout()
+	errOut := cmd.ErrOrStderr()
 	id := args[0]
 	st := getStore()
 	if st != nil {
 		if _, err := st.GetContainer(id); err != nil {
-			fmt.Fprintln(os.Stderr, "unknown container")
+			fmt.Fprintln(errOut, "unknown container")
 			os.Exit(1)
 		}
 	}
@@ -42,69 +44,67 @@ func logsRun(cmd *cobra.Command, args []string) {
 	path := filepath.Join(home, ".pocket-docker", "logs", id+".log")
 	f, err := os.Open(path)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "unknown container")
+		fmt.Fprintln(errOut, "unknown container")
 		os.Exit(1)
 	}
 	defer f.Close()
 	if !follow {
-		// Display the last tailLines lines (or full file if tailLines <= 0)
-		data, err := io.ReadAll(f)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "read log:", err)
+		if _, err := f.Seek(0, 0); err != nil {
+			fmt.Fprintln(errOut, "read log:", err)
 			os.Exit(1)
 		}
-		lines := bytes.Split(data, []byte("\n"))
-		if tailLines > 0 && len(lines) > tailLines {
-			lines = lines[len(lines)-tailLines:]
-		}
-		for _, line := range lines {
-			if len(line) > 0 {
-				fmt.Println(string(line))
-			}
+		if _, err := io.Copy(out, f); err != nil {
+			fmt.Fprintln(errOut, "read log:", err)
+			os.Exit(1)
 		}
 		return
 	}
 	data, err := io.ReadAll(f)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "read log:", err)
+		fmt.Fprintln(errOut, "read log:", err)
 		os.Exit(1)
 	}
 	lines := bytes.Split(data, []byte("\n"))
 	if tailLines > 0 && len(lines) > tailLines {
 		lines = lines[len(lines)-tailLines:]
 	}
-	out := bytes.Join(lines, []byte("\n"))
-	if len(out) > 0 {
-		if !bytes.HasSuffix(out, []byte("\n")) {
-			out = append(out, '\n')
+	outBytes := bytes.Join(lines, []byte("\n"))
+	if len(outBytes) > 0 {
+		if !bytes.HasSuffix(outBytes, []byte("\n")) {
+			outBytes = append(outBytes, '\n')
 		}
-		os.Stdout.Write(out)
+		out.Write(outBytes)
 	}
 	ctx := cmd.Context()
-	buf := make([]byte, 1024)
 	for {
+		buf := make([]byte, 1024)
 		n, err := f.Read(buf)
 		if n > 0 {
-			os.Stdout.Write(buf[:n])
+			out.Write(buf[:n])
 		}
 		if err != nil {
 			if err == io.EOF {
+				// Сначала проверяем, не отменили ли мы уже контекст
 				select {
 				case <-ctx.Done():
 					return
-				case <-time.After(100 * time.Millisecond):
-					continue
+				default:
 				}
+				// Немного ждём перед новой попыткой
+				time.Sleep(50 * time.Millisecond)
+				continue
 			}
-			fmt.Fprintln(os.Stderr, "read log:", err)
+			fmt.Fprintln(errOut, "read log:", err)
 			os.Exit(1)
 		}
 	}
 }
 
 func userHomeDir() string {
-	sudo := os.Getenv("SUDO_USER")
-	if sudo != "" {
+	if home := os.Getenv("HOME"); home != "" {
+		return home
+	}
+	if sudo := os.Getenv("SUDO_USER"); sudo != "" {
 		if u, err := user.Lookup(sudo); err == nil {
 			return u.HomeDir
 		}

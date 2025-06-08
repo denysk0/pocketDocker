@@ -66,9 +66,9 @@ var (
 	healthCmd      string
 	healthInterval int
 	restartMax     int
+	detach         bool
 )
 
-// RunCmd runs a container
 var RunCmd = &cobra.Command{
 	Use:   "run",
 	Short: "run a container",
@@ -170,6 +170,10 @@ var RunCmd = &cobra.Command{
 				fmt.Println(id)
 				printedID = true
 			}
+			// If detached, exit immediately after printing ID
+			if detach {
+				return
+			}
 
 			ctx, cancel := context.WithCancel(context.Background())
 			failCh := make(chan struct{}, 1)
@@ -192,7 +196,7 @@ var RunCmd = &cobra.Command{
 				logging.Append(id, "FAILED health-check")
 			case <-exitCh:
 				// container exited (normal or error), treat as failure if under restart limit
-				if restartMax == 0 || restartCount < restartMax {
+				if restartMax > 0 && restartCount < restartMax {
 					logging.Append(id, "FAILED health-check")
 				}
 			}
@@ -206,6 +210,13 @@ var RunCmd = &cobra.Command{
 			}
 
 			if restartMax > 0 && restartCount >= restartMax {
+				if st != nil {
+					info.State = "Stopped"
+					st.SaveContainer(info)
+				}
+				return
+			} else if restartMax == 0 {
+				// No restarts allowed, exit loop after first run
 				if st != nil {
 					info.State = "Stopped"
 					st.SaveContainer(info)
@@ -227,6 +238,7 @@ func init() {
 	RunCmd.Flags().StringVar(&healthCmd, "health-cmd", "", "health check command")
 	RunCmd.Flags().IntVar(&healthInterval, "health-interval", 30, "health check interval seconds")
 	RunCmd.Flags().IntVar(&restartMax, "restart-max", 0, "max restarts (0 = unlimited)")
+	RunCmd.Flags().BoolVarP(&detach, "detach", "d", false, "run container in background")
 	err := RunCmd.MarkFlagRequired("rootfs")
 	if err != nil {
 		return
