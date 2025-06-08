@@ -5,6 +5,8 @@ package runtime
 
 import (
 	"fmt"
+	"github.com/creack/pty"
+	"golang.org/x/sys/unix"
 	"os"
 	"syscall"
 )
@@ -52,13 +54,24 @@ func SetupContainerRoot(rootfsPath string) error {
 
 // CloneAndRun clones the current process into new namespaces
 // then runs cmdPath with args inside the isolated environment
-func CloneAndRun(cmdPath string, args []string, rootfsPath string) (int, error) {
+func CloneAndRun(cmdPath string, args []string, rootfsPath string) (int, *os.File, error) {
+	master, slave, err := pty.Open()
+	if err != nil {
+		return 0, nil, err
+	}
 	flags := uintptr(syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWNET | syscall.SIGCHLD)
 	pid, _, errno := syscall.RawSyscall(syscall.SYS_CLONE, flags, 0, 0)
 	if errno != 0 {
-		return 0, errno
+		master.Close()
+		slave.Close()
+		return 0, nil, errno
 	}
 	if pid == 0 {
+		master.Close()
+		slaveFD := int(slave.Fd())
+		unix.Dup2(slaveFD, 1)
+		unix.Dup2(slaveFD, 2)
+		slave.Close()
 		if err := SetupContainerRoot(rootfsPath); err != nil {
 			fmt.Fprintf(os.Stderr, "SetupContainerRoot error: %v\n", err)
 			os.Exit(1)
@@ -68,6 +81,6 @@ func CloneAndRun(cmdPath string, args []string, rootfsPath string) (int, error) 
 			os.Exit(1)
 		}
 	}
-
-	return int(pid), nil
+	slave.Close()
+	return int(pid), master, nil
 }

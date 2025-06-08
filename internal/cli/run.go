@@ -5,16 +5,18 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"github.com/mattn/go-shellwords"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
+	"github.com/denysk0/pocketDocker/internal/logging"
 	"github.com/denysk0/pocketDocker/internal/runtime"
 	"github.com/denysk0/pocketDocker/internal/runtime/cgroups"
 	"github.com/denysk0/pocketDocker/internal/store"
-	"github.com/mattn/go-shellwords"
 	"github.com/spf13/cobra"
 )
 
@@ -30,6 +32,7 @@ var RunCmd = &cobra.Command{
 	Use:   "run",
 	Short: "run a container",
 	Run: func(cmd *cobra.Command, args []string) {
+		var pr io.ReadCloser
 		if rootfs == "" || command == "" {
 			fmt.Fprintln(os.Stderr, "both --rootfs and --cmd flags are required")
 			os.Exit(1)
@@ -100,10 +103,17 @@ var RunCmd = &cobra.Command{
 		if !strings.Contains(binary, "/") {
 			binary = "/bin/" + binary
 		}
-		pid, err := runtime.CloneAndRun(binary, parts[1:], rootfsDir)
+		pid, master, err := runtime.CloneAndRun(binary, parts[1:], rootfsDir)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to run command: %v\n", err)
 			os.Exit(1)
+		}
+		if master != nil {
+			var errAttach error
+			pr, errAttach = logging.Attach(id, master)
+			if errAttach != nil {
+				fmt.Fprintf(os.Stderr, "failed to attach logs: %v\n", errAttach)
+			}
 		}
 
 		if memoryLimit > 0 {
@@ -137,7 +147,24 @@ var RunCmd = &cobra.Command{
 		}
 
 		fmt.Println(id)
-		os.Exit(0)
+
+		// Wait for container process to exit so logs are fully captured
+		var ws syscall.WaitStatus
+		_, _ = syscall.Wait4(pid, &ws, 0, nil)
+
+		// After exit, close the masterPTY to signal logging.Attach to finish
+		if master != nil {
+			master.Close()
+		}
+
+		// Drain the log pipe to ensure all log data is written
+		if pr != nil {
+			_, _ = io.Copy(io.Discard, pr)
+			pr.Close()
+		}
+
+		// Return to allow cobra to exit naturally
+		return
 	},
 }
 

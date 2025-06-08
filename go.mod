@@ -3,6 +3,7 @@ module github.com/denysk0/pocketDocker
 go 1.24.3
 
 require (
+	github.com/creack/pty v1.1.21 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
@@ -17,4 +18,5 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 	modernc.org/sqlite v1.37.1 // indirect
+	github.com/mattn/go-shellwords v1.0.12
 )
