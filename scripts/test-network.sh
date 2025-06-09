@@ -8,6 +8,7 @@ for iface in $(ip -o link show | awk -F': ' '/veth/ {print $2}' | cut -d'@' -f1)
 done
 sudo iptables -t nat -F PREROUTING
 sudo iptables -t nat -F POSTROUTING
+sudo iptables -t nat -F OUTPUT
 
 export PATH=$PATH:/usr/sbin:/sbin:/usr/local/go/bin
 
@@ -24,7 +25,7 @@ echo "Container $ID started"
 # give container time
 sleep 3
 
-resp=$(curl -s http://localhost:8080)
+resp=$(curl -4 -s http://127.0.0.1:8080)
 if [[ "$resp" != "hi" ]]; then
   echo "unexpected response: $resp"
   sudo $BIN stop "$ID"

@@ -31,9 +31,10 @@ func TestSetupNetworkingCommands(t *testing.T) {
 		{"nsenter", "--target", "123", "--net", "ip", "addr", "add", "10.42.0." +
 			strconv.Itoa(ipSuffixFromID("abcdef0123456789")) + "/24", "dev", "vethabcdef01_c"},
 		{"nsenter", "--target", "123", "--net", "ip", "route", "add", "default", "via", "10.42.0.1"},
-		{"sysctl", "-w", "net.ipv4.ip_forward=1"},
-		{"iptables", "-t", "nat", "-A", "PREROUTING", "-p", "tcp", "--dport", "8080", "-j", "DNAT", "--to-destination", "10.42.0." + strconv.Itoa(ipSuffixFromID("abcdef0123456789")) + ":80"},
-		{"iptables", "-t", "nat", "-A", "OUTPUT", "-p", "tcp", "--dport", "8080", "-j", "DNAT", "--to-destination", "10.42.0." + strconv.Itoa(ipSuffixFromID("abcdef0123456789")) + ":80"},
+		{"iptables", "-A", "FORWARD", "-o", "vethabcdef01", "-j", "ACCEPT"},
+		{"iptables", "-A", "FORWARD", "-i", "vethabcdef01", "-j", "ACCEPT"},
+		{"iptables", "-t", "nat", "-A", "PREROUTING", "-p", "tcp", "-m", "tcp", "--dport", "8080", "-j", "DNAT", "--to-destination", "10.42.0." + strconv.Itoa(ipSuffixFromID("abcdef0123456789")) + ":80"},
+		{"iptables", "-t", "nat", "-A", "OUTPUT", "-p", "tcp", "-m", "tcp", "--dport", "8080", "-j", "DNAT", "--to-destination", "10.42.0." + strconv.Itoa(ipSuffixFromID("abcdef0123456789")) + ":80"},
 		{"iptables", "-t", "nat", "-A", "POSTROUTING", "-s", "10.42.0." + strconv.Itoa(ipSuffixFromID("abcdef0123456789")) + "/32", "-j", "MASQUERADE"},
 	}
 	if !reflect.DeepEqual(f.cmds, want) {
