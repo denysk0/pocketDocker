@@ -6,16 +6,16 @@ import (
 	"testing"
 )
 
-type fakeRunner struct{ cmds [][]string }
+type fakeNetRunner struct{ cmds [][]string }
 
-func (f *fakeRunner) Run(cmd string, args ...string) error {
+func (f *fakeNetRunner) Run(cmd string, args ...string) error {
 	c := append([]string{cmd}, args...)
 	f.cmds = append(f.cmds, c)
 	return nil
 }
 
 func TestSetupNetworkingCommands(t *testing.T) {
-	f := &fakeRunner{}
+	f := &fakeNetRunner{}
 	ports := []PortMap{{Host: 8080, Container: 80}}
 	err := SetupNetworking(123, "abcdef0123456789", ports, f)
 	if err != nil {

@@ -51,6 +51,7 @@ func main() {
 	rootCmd.AddCommand(cli.PullCmd)
 	rootCmd.AddCommand(cli.LogsCmd)
 	rootCmd.AddCommand(cli.RmCmd)
+	rootCmd.AddCommand(cli.ExecCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
