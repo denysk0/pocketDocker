@@ -19,7 +19,7 @@ func TestStoreCRUD(t *testing.T) {
 	if err := s.Init(); err != nil {
 		t.Fatal(err)
 	}
-	info := ContainerInfo{ID: "1", Name: "n", Image: "img", PID: 123, State: "Running", StartedAt: time.Now(), RestartMax: 0}
+	info := ContainerInfo{ID: "1", Name: "n", Image: "img", PID: 123, State: "Running", StartedAt: time.Now(), RestartMax: 0, Ports: "8080:80"}
 	if err := s.SaveContainer(info); err != nil {
 		t.Fatalf("save: %v", err)
 	}
@@ -44,7 +44,7 @@ func TestStoreCRUD(t *testing.T) {
 	if err != nil || len(list) != 0 {
 		t.Fatalf("delete check failed")
 	}
-	
+
 	img := ImageInfo{Name: "busybox", Path: "/tmp/busybox", CreatedAt: time.Now()}
 	if err := s.SaveImage(img); err != nil {
 		t.Fatalf("save image: %v", err)

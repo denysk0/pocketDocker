@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"context"
 	"io"
 	"os"
 	"os/exec"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func TestCloneAndRunUserNamespace(t *testing.T) {
@@ -22,16 +24,92 @@ func TestCloneAndRunUserNamespace(t *testing.T) {
 		t.Fatalf("untar busybox: %v: %s", err, out)
 	}
 
-	pid, master, err := CloneAndRun("/bin/sh", []string{"-c", "id -u; sleep 0.5"}, rootfs)
+	// Check if /bin/sh exists in extracted rootfs
+	shPath := filepath.Join(rootfs, "bin", "sh")
+	if _, err := os.Stat(shPath); err != nil {
+		t.Fatalf("/bin/sh not found in rootfs: %v", err)
+	}
+	t.Logf("Found /bin/sh at %s", shPath)
+
+	pid, master, unblock, err := CloneAndRun("/bin/sh", []string{"-c", "echo starting; id -u; echo done; sleep 0.5"}, rootfs)
 	if err != nil {
 		t.Fatalf("CloneAndRun: %v", err)
 	}
-	defer master.Close()
+	defer func() {
+		if err := master.Close(); err != nil {
+			t.Logf("Error closing master PTY: %v", err)
+		}
+	}()
+	t.Logf("Created process PID=%d", pid)
+	
+	// Unblock the child process so it can proceed to exec and exit
+	// Write a byte to signal the child to continue
+	if _, err := unblock.Write([]byte{1}); err != nil {
+		t.Fatalf("Error writing to unblock pipe: %v", err)
+	}
+	if err := unblock.Close(); err != nil {
+		t.Fatalf("Error closing unblock pipe: %v", err)
+	}
+	t.Logf("Unblocked child process")
 
-	outBytes, _ := io.ReadAll(master)
-	inside := strings.TrimSpace(string(outBytes))
-	if inside != "0" {
-		t.Fatalf("uid inside container = %s, want 0", inside)
+	// Read output with timeout to prevent hanging
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	
+	resultCh := make(chan []byte, 1)
+	errorCh := make(chan error, 1)
+	
+	go func() {
+		data, err := io.ReadAll(master)
+		if err != nil {
+			errorCh <- err
+			return
+		}
+		resultCh <- data
+	}()
+	
+	// Check process status periodically
+	go func() {
+		for i := 0; i < 5; i++ {
+			time.Sleep(1 * time.Second)
+			if err := syscall.Kill(pid, 0); err != nil {
+				t.Logf("Process %d status check failed after %ds: %v", pid, i+1, err)
+				return
+			}
+			t.Logf("Process %d still alive after %ds", pid, i+1)
+		}
+	}()
+	
+	var outBytes []byte
+	select {
+	case outBytes = <-resultCh:
+		t.Logf("Successfully received data from PTY")
+	case err := <-errorCh:
+		t.Fatalf("error reading from master: %v", err)
+	case <-ctx.Done():
+		// Final process check before failing
+		if err := syscall.Kill(pid, 0); err != nil {
+			t.Fatalf("timeout reading from master PTY - process %d is dead: %v", pid, err)
+		} else {
+			t.Fatalf("timeout reading from master PTY - process %d still alive but not outputting", pid)
+		}
+	}
+	
+	output := string(outBytes)
+	t.Logf("Container output: %q", output)
+	
+	// Look for "0" in the output (from id -u command)
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	var uidLine string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "0" {
+			uidLine = line
+			break
+		}
+	}
+	if uidLine != "0" {
+		t.Fatalf("uid inside container not found or != 0, full output: %q", output)
 	}
 
 	hostOut, err := exec.Command("ps", "-o", "uid=", "-p", strconv.Itoa(pid)).Output()
@@ -44,5 +122,7 @@ func TestCloneAndRunUserNamespace(t *testing.T) {
 	}
 
 	var ws syscall.WaitStatus
-	syscall.Wait4(pid, &ws, 0, nil)
+	if _, err := syscall.Wait4(pid, &ws, 0, nil); err != nil {
+		t.Logf("Wait4 error: %v", err)
+	}
 }

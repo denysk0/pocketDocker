@@ -19,6 +19,7 @@ type ContainerInfo struct {
 	HealthCmd      string
 	HealthInterval int
 	RestartMax     int
+	Ports          string
 }
 
 type Store struct {
@@ -45,7 +46,8 @@ func (s *Store) Init() error {
         restart_count INTEGER DEFAULT 0,
         health_cmd TEXT,
         health_interval INTEGER DEFAULT 0,
-        restart_max INTEGER DEFAULT 0
+        restart_max INTEGER DEFAULT 0,
+        ports TEXT
     )`)
 
 	if err != nil {
@@ -102,6 +104,11 @@ func (s *Store) Init() error {
 			return err
 		}
 	}
+	if !cols["ports"] {
+		if _, err := s.db.Exec("ALTER TABLE containers ADD COLUMN ports TEXT"); err != nil {
+			return err
+		}
+	}
 	if _, err = s.db.Exec("PRAGMA journal_mode = WAL;"); err != nil {
 		return err
 	}
@@ -112,15 +119,15 @@ func (s *Store) Init() error {
 }
 
 func (s *Store) SaveContainer(c ContainerInfo) error {
-	_, err := s.db.Exec(`INSERT INTO containers(id, name, image, pid, state, started_at, rootfs_dir, restart_count, health_cmd, health_interval, restart_max)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET name=excluded.name,image=excluded.image,pid=excluded.pid,state=excluded.state,started_at=excluded.started_at,rootfs_dir=excluded.rootfs_dir,restart_count=excluded.restart_count,health_cmd=excluded.health_cmd,health_interval=excluded.health_interval,restart_max=excluded.restart_max`,
-		c.ID, c.Name, c.Image, c.PID, c.State, c.StartedAt.Format(time.RFC3339), c.RootfsDir, c.RestartCount, c.HealthCmd, c.HealthInterval, c.RestartMax)
+	_, err := s.db.Exec(`INSERT INTO containers(id, name, image, pid, state, started_at, rootfs_dir, restart_count, health_cmd, health_interval, restart_max, ports)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET name=excluded.name,image=excluded.image,pid=excluded.pid,state=excluded.state,started_at=excluded.started_at,rootfs_dir=excluded.rootfs_dir,restart_count=excluded.restart_count,health_cmd=excluded.health_cmd,health_interval=excluded.health_interval,restart_max=excluded.restart_max,ports=excluded.ports`,
+		c.ID, c.Name, c.Image, c.PID, c.State, c.StartedAt.Format(time.RFC3339), c.RootfsDir, c.RestartCount, c.HealthCmd, c.HealthInterval, c.RestartMax, c.Ports)
 	return err
 }
 
 func (s *Store) ListContainers() ([]ContainerInfo, error) {
-	rows, err := s.db.Query(`SELECT id, name, image, pid, state, started_at, rootfs_dir, restart_count, COALESCE(health_cmd, ''), health_interval, restart_max FROM containers`)
+	rows, err := s.db.Query(`SELECT id, name, image, pid, state, started_at, rootfs_dir, restart_count, COALESCE(health_cmd, ''), health_interval, restart_max, COALESCE(ports, '') FROM containers`)
 	if err != nil {
 		return nil, err
 	}
@@ -128,26 +135,28 @@ func (s *Store) ListContainers() ([]ContainerInfo, error) {
 	var out []ContainerInfo
 	for rows.Next() {
 		var c ContainerInfo
-		var t, rootfsDir string
-		if err := rows.Scan(&c.ID, &c.Name, &c.Image, &c.PID, &c.State, &t, &rootfsDir, &c.RestartCount, &c.HealthCmd, &c.HealthInterval, &c.RestartMax); err != nil {
+		var t, rootfsDir, ports string
+		if err := rows.Scan(&c.ID, &c.Name, &c.Image, &c.PID, &c.State, &t, &rootfsDir, &c.RestartCount, &c.HealthCmd, &c.HealthInterval, &c.RestartMax, &ports); err != nil {
 			return nil, err
 		}
 		c.StartedAt, _ = time.Parse(time.RFC3339, t)
 		c.RootfsDir = rootfsDir
+		c.Ports = ports
 		out = append(out, c)
 	}
 	return out, rows.Err()
 }
 
 func (s *Store) GetContainer(id string) (ContainerInfo, error) {
-	row := s.db.QueryRow(`SELECT id, name, image, pid, state, started_at, rootfs_dir, restart_count, COALESCE(health_cmd, ''), health_interval, restart_max FROM containers WHERE id = ?`, id)
+	row := s.db.QueryRow(`SELECT id, name, image, pid, state, started_at, rootfs_dir, restart_count, COALESCE(health_cmd, ''), health_interval, restart_max, COALESCE(ports, '') FROM containers WHERE id = ?`, id)
 	var c ContainerInfo
-	var t, rootfsDir string
-	if err := row.Scan(&c.ID, &c.Name, &c.Image, &c.PID, &c.State, &t, &rootfsDir, &c.RestartCount, &c.HealthCmd, &c.HealthInterval, &c.RestartMax); err != nil {
+	var t, rootfsDir, ports string
+	if err := row.Scan(&c.ID, &c.Name, &c.Image, &c.PID, &c.State, &t, &rootfsDir, &c.RestartCount, &c.HealthCmd, &c.HealthInterval, &c.RestartMax, &ports); err != nil {
 		return ContainerInfo{}, err
 	}
 	c.StartedAt, _ = time.Parse(time.RFC3339, t)
 	c.RootfsDir = rootfsDir
+	c.Ports = ports
 	return c, nil
 }
 

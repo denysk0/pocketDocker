@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -63,6 +64,8 @@ var (
 	command        string
 	memoryLimit    int64
 	cpuShares      int64
+	publish        []string
+	enableNet      bool
 	healthCmd      string
 	healthInterval int
 	restartMax     int
@@ -123,7 +126,7 @@ var RunCmd = &cobra.Command{
 				os.Exit(1)
 			}
 
-			pid, master, err := runtime.CloneAndRun(binary, parts[1:], rootfsDir)
+			pid, master, unblock, err := runtime.CloneAndRun(binary, parts[1:], rootfsDir)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "failed to run command: %v\n", err)
 				os.Exit(1)
@@ -149,6 +152,33 @@ var RunCmd = &cobra.Command{
 				}
 			}
 
+			if enableNet || len(publish) > 0 {
+				var pm []runtime.PortMap
+				for _, p := range publish {
+					parts := strings.SplitN(p, ":", 2)
+					if len(parts) != 2 {
+						fmt.Fprintf(os.Stderr, "invalid publish format: %s\n", p)
+						os.Exit(1)
+					}
+					hp, err1 := strconv.Atoi(parts[0])
+					cp, err2 := strconv.Atoi(parts[1])
+					if err1 != nil || err2 != nil {
+						fmt.Fprintf(os.Stderr, "invalid publish format: %s\n", p)
+						os.Exit(1)
+					}
+					pm = append(pm, runtime.PortMap{Host: hp, Container: cp})
+				}
+				if err := runtime.SetupNetworking(pid, id, pm, nil); err != nil {
+					fmt.Fprintf(os.Stderr, "network setup failed: %v\n", err)
+					os.Exit(1)
+				}
+				// Networking ready — unblock child so it can exec its command
+				unblock.Close()
+			} else {
+				// No networking: unblock child immediately
+				unblock.Close()
+			}
+
 			info := store.ContainerInfo{
 				ID:             id,
 				Name:           name,
@@ -161,6 +191,7 @@ var RunCmd = &cobra.Command{
 				HealthCmd:      healthCmd,
 				HealthInterval: healthInterval,
 				RestartMax:     restartMax,
+				Ports:          strings.Join(publish, ","),
 			}
 			st := getStore()
 			if st != nil {
@@ -235,6 +266,8 @@ func init() {
 	RunCmd.Flags().StringVar(&command, "cmd", "", "command to run inside container (e.g. \"/bin/sh\")")
 	RunCmd.Flags().Int64Var(&memoryLimit, "memory", 0, "memory limit in bytes (e.g. 104857600 for 100 MB)")
 	RunCmd.Flags().Int64Var(&cpuShares, "cpu-shares", 0, "CPU weight 1–10000 (100 = default)")
+	RunCmd.Flags().StringArrayVarP(&publish, "publish", "p", nil, "publish port mapping H:C")
+	RunCmd.Flags().BoolVar(&enableNet, "network", false, "enable networking namespace")
 	RunCmd.Flags().StringVar(&healthCmd, "health-cmd", "", "health check command")
 	RunCmd.Flags().IntVar(&healthInterval, "health-interval", 30, "health check interval seconds")
 	RunCmd.Flags().IntVar(&restartMax, "restart-max", 0, "max restarts (0 = unlimited)")
