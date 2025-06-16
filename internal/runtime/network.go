@@ -1,3 +1,5 @@
+//go:build linux
+
 package runtime
 
 import (
@@ -5,7 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
-	// Ensure fmt and strconv are imported for CleanupNetworking
+	"bytes"
+	"strings"
 )
 
 type CmdRunner interface {
@@ -25,15 +28,74 @@ func defaultRunner() CmdRunner {
 	return realRunner{}
 }
 
-func ipSuffixFromID(id string) int {
-	if len(id) < 2 {
-		return 2
+// IptablesChecker interface allows mocking iptables rule checking
+type IptablesChecker interface {
+	CheckRule(args ...string) bool
+}
+
+type realIptablesChecker struct{}
+
+func (realIptablesChecker) CheckRule(args ...string) bool {
+	return checkIptablesRuleReal(args...)
+}
+
+func checkIptablesRuleReal(args ...string) bool {
+	checkArgs := make([]string, len(args))
+	copy(checkArgs, args)
+	for i, arg := range checkArgs {
+		if arg == "-A" {
+			checkArgs[i] = "-C"
+			break
+		}
 	}
-	b, err := strconv.ParseUint(id[:2], 16, 8)
+	
+	cmd := exec.Command("iptables", checkArgs...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	return err == nil
+}
+
+func ipSuffixFromID(id string) int {
+	return ipSuffixFromIDWithCollisionCheck(id, nil)
+}
+
+func ipSuffixFromIDWithCollisionCheck(id string, checker func(int) bool) int {
+	if len(id) < 6 {
+		id = id + "000000"
+	}
+	v, err := strconv.ParseUint(id[:6], 16, 32)
 	if err != nil {
 		return 2
 	}
-	return int(b%250) + 2
+	suffix := int(v%250) + 2
+	
+	if checker == nil {
+		return suffix
+	}
+	
+	for i := 0; i < 250; i++ {
+		candidate := suffix + i
+		if candidate > 254 {
+			candidate = (candidate % 253) + 2
+		}
+		if !checker(candidate) {
+			return candidate
+		}
+	}
+	
+	return 2
+}
+
+// checkIPInUse checks if a given IP suffix is already assigned to a veth interface
+func checkIPInUse(suffix int) bool {
+	targetIP := fmt.Sprintf("10.42.0.%d", suffix)
+	cmd := exec.Command("ip", "addr", "show")
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(output), targetIP)
 }
 
 // PortMap represents a published port mapping
@@ -43,7 +105,24 @@ type PortMap struct {
 }
 
 // SetupNetworking configures veth pair and iptables rules for the container
-func SetupNetworking(pid int, id string, ports []PortMap, r CmdRunner) error {
+// Returns the original ip_forward value and actual IP suffix used
+func SetupNetworking(pid int, id string, ports []PortMap, r CmdRunner) (string, int, error) {
+	return SetupNetworkingWithChecker(pid, id, ports, r, realIptablesChecker{})
+}
+
+// SetupNetworkingWithChecker configures veth pair and iptables rules for the container with custom checker
+// Returns the original ip_forward value and actual IP suffix used
+func SetupNetworkingWithChecker(pid int, id string, ports []PortMap, r CmdRunner, checker IptablesChecker) (string, int, error) {
+	origBytes, _ := os.ReadFile("/proc/sys/net/ipv4/ip_forward")
+	origValue := strings.TrimSpace(string(origBytes))
+	
+	success := false
+	ipSuffix := ipSuffixFromIDWithCollisionCheck(id, checkIPInUse)
+	defer func() {
+		if !success {
+			_ = CleanupNetworkingWithIPSuffix(id, ipSuffix, ports, origValue)
+		}
+	}()
 	if r == nil {
 		r = defaultRunner()
 	}
@@ -52,83 +131,117 @@ func SetupNetworking(pid int, id string, ports []PortMap, r CmdRunner) error {
 		short = id[:8]
 	}
 	hostVeth := "veth" + short
+	if len(hostVeth) > 13 {
+		hostVeth = hostVeth[:13]
+	}
 	contVeth := hostVeth + "_c"
-	ipSuffix := ipSuffixFromID(id)
-
+	
 	if err := r.Run("ip", "link", "add", hostVeth, "type", "veth", "peer", "name", contVeth); err != nil {
-		return err
+		return "", 0, err
 	}
 	_ = r.Run("ip", "addr", "add", "10.42.0.1/24", "dev", hostVeth)
 	if err := r.Run("ip", "link", "set", hostVeth, "up"); err != nil {
-		return err
+		return "", 0, err
 	}
 	if err := r.Run("ip", "link", "set", contVeth, "netns", strconv.Itoa(pid)); err != nil {
-		return err
+		return "", 0, err
 	}
 	if err := r.Run("nsenter", "--target", strconv.Itoa(pid), "--net", "ip", "link", "set", "lo", "up"); err != nil {
-		return err
+		return "", 0, err
 	}
 	if err := r.Run("nsenter", "--target", strconv.Itoa(pid), "--net", "ip", "link", "set", contVeth, "up"); err != nil {
-		return err
+		return "", 0, err
 	}
 	addr := fmt.Sprintf("10.42.0.%d/24", ipSuffix)
 	if err := r.Run("nsenter", "--target", strconv.Itoa(pid), "--net", "ip", "addr", "add", addr, "dev", contVeth); err != nil {
-		return err
+		return "", 0, err
 	}
 	if err := r.Run("nsenter", "--target", strconv.Itoa(pid), "--net", "ip", "route", "add", "default", "via", "10.42.0.1"); err != nil {
-		return err
+		return "", 0, err
 	}
-	// enable IP forwarding
-	_ = os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1"), 0644)
-	// allow packets to be forwarded to / from this veth
-	if err := r.Run("iptables", "-A", "FORWARD", "-o", hostVeth, "-j", "ACCEPT"); err != nil {
-		return err
+	
+	if os.Geteuid() == 0 {
+		if err := os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1"), 0644); err != nil {
+			return "", 0, fmt.Errorf("enable ip_forward: %w", err)
+		}
 	}
-	if err := r.Run("iptables", "-A", "FORWARD", "-i", hostVeth, "-j", "ACCEPT"); err != nil {
-		return err
+	
+	forwardOutArgs := []string{"-A", "FORWARD", "-o", hostVeth, "-j", "ACCEPT"}
+	if !checker.CheckRule(forwardOutArgs...) {
+		if err := r.Run("iptables", forwardOutArgs...); err != nil {
+			return "", 0, err
+		}
+	}
+	
+	forwardInArgs := []string{"-A", "FORWARD", "-i", hostVeth, "-j", "ACCEPT"}
+	if !checker.CheckRule(forwardInArgs...) {
+		if err := r.Run("iptables", forwardInArgs...); err != nil {
+			return "", 0, err
+		}
 	}
 
 	for _, pm := range ports {
 		h := strconv.Itoa(pm.Host)
 		c := strconv.Itoa(pm.Container)
 		dest := fmt.Sprintf("10.42.0.%d:%s", ipSuffix, c)
-		if err := r.Run("iptables", "-t", "nat", "-A", "PREROUTING",
+		
+		preroutingArgs := []string{"-t", "nat", "-A", "PREROUTING",
 			"-p", "tcp", "-m", "tcp", "--dport", h,
-			"-j", "DNAT", "--to-destination", dest); err != nil {
-			return err
+			"-j", "DNAT", "--to-destination", dest}
+		if !checker.CheckRule(preroutingArgs...) {
+			if err := r.Run("iptables", preroutingArgs...); err != nil {
+				return "", 0, err
+			}
 		}
-		// Add OUTPUT rule for local packets to published port
-		if err := r.Run("iptables", "-t", "nat", "-A", "OUTPUT",
+		
+		outputArgs := []string{"-t", "nat", "-A", "OUTPUT",
 			"-p", "tcp", "-m", "tcp", "--dport", h,
-			"-j", "DNAT", "--to-destination", dest); err != nil {
-			return err
+			"-j", "DNAT", "--to-destination", dest}
+		if !checker.CheckRule(outputArgs...) {
+			if err := r.Run("iptables", outputArgs...); err != nil {
+				return "", 0, err
+			}
 		}
-		if err := r.Run("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", fmt.Sprintf("10.42.0.%d/32", ipSuffix), "-j", "MASQUERADE"); err != nil {
-			return err
+		
+		postroutingArgs := []string{"-t", "nat", "-A", "POSTROUTING", 
+			"-s", fmt.Sprintf("10.42.0.%d/32", ipSuffix), "-j", "MASQUERADE"}
+		if !checker.CheckRule(postroutingArgs...) {
+			if err := r.Run("iptables", postroutingArgs...); err != nil {
+				return "", 0, err
+			}
 		}
 	}
-	return nil
+	success = true
+	return origValue, ipSuffix, nil
 }
 
 // CleanupNetworking removes veth interface and iptables rules for the container.
 func CleanupNetworking(id string, ports []PortMap) error {
+	ipSuffix := ipSuffixFromID(id)
+	return CleanupNetworkingWithIPSuffix(id, ipSuffix, ports, "")
+}
+
+// CleanupNetworkingWithRestore removes networking resources and restores ip_forward
+func CleanupNetworkingWithRestore(id string, ports []PortMap, ipForwardOrig string) error {
+	ipSuffix := ipSuffixFromID(id)
+	return CleanupNetworkingWithIPSuffix(id, ipSuffix, ports, ipForwardOrig)
+}
+
+// CleanupNetworkingWithIPSuffix removes networking resources using specific IP suffix
+func CleanupNetworkingWithIPSuffix(id string, ipSuffix int, ports []PortMap, ipForwardOrig string) error {
 	short := id
 	if len(short) > 8 {
 		short = id[:8]
 	}
 	hostVeth := "veth" + short
 
-	// delete host veth interface
 	_, _ = exec.Command("ip", "link", "del", hostVeth).CombinedOutput()
 
-	// remove FORWARD chain rules
 	_, _ = exec.Command("iptables", "-D", "FORWARD", "-o", hostVeth, "-j", "ACCEPT").CombinedOutput()
 	_, _ = exec.Command("iptables", "-D", "FORWARD", "-i", hostVeth, "-j", "ACCEPT").CombinedOutput()
 
-	// remove NAT rules
 	for _, pm := range ports {
 		h := strconv.Itoa(pm.Host)
-		ipSuffix := ipSuffixFromID(id)
 		dest := fmt.Sprintf("10.42.0.%d:%d", ipSuffix, pm.Container)
 		_, _ = exec.Command("iptables", "-t", "nat", "-D", "PREROUTING",
 			"-p", "tcp", "-m", "tcp", "--dport", h,
@@ -140,5 +253,10 @@ func CleanupNetworking(id string, ports []PortMap) error {
 			"-s", fmt.Sprintf("10.42.0.%d/32", ipSuffix),
 			"-j", "MASQUERADE").CombinedOutput()
 	}
+	
+	if ipForwardOrig != "" {
+		_ = os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte(ipForwardOrig), 0644)
+	}
+	
 	return nil
 }

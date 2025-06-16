@@ -2,11 +2,13 @@ package cgroups
 
 import (
 	"bufio"
+	"context"
 	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -14,9 +16,6 @@ import (
 func ensureCgroupDir(containerID string) (string, error) {
 	dir := filepath.Join(CgroupRoot, containerID)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		if pe, ok := err.(*os.PathError); ok && (pe.Err == syscall.EROFS || pe.Err == syscall.EPERM) {
-			return CgroupRoot, nil // fallback to root cgroup
-		}
 		return "", err
 	}
 	return dir, nil
@@ -24,6 +23,15 @@ func ensureCgroupDir(containerID string) (string, error) {
 
 // CgroupRoot points to the cgroup v2 mount point.
 var CgroupRoot = "/sys/fs/cgroup"
+
+// Global map to track OOM monitor cancellation functions and completion
+type oomMonitorInfo struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+var oomMonitors = make(map[string]*oomMonitorInfo)
+var oomMonitorsMutex sync.Mutex
 
 // ApplyMemoryLimit creates a cgroup for containerID and applies the
 // provided memory limit in bytes. It also monitors OOM events and
@@ -40,7 +48,17 @@ func ApplyMemoryLimit(containerID string, pid int, limitBytes int64) error {
 		return err
 	}
 
-	go monitorOOM(dir, pid)
+	// Start OOM monitor with cancellable context
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	oomMonitorsMutex.Lock()
+	oomMonitors[containerID] = &oomMonitorInfo{
+		cancel: cancel,
+		done:   done,
+	}
+	oomMonitorsMutex.Unlock()
+	
+	go monitorOOM(ctx, containerID, dir, pid, done)
 	return nil
 }
 
@@ -59,13 +77,25 @@ func ApplyCPUShares(containerID string, pid int, shares int64) error {
 	return nil
 }
 
-// RemoveCgroup removes cgroup directory for given containerID
+// RemoveCgroup removes cgroup directory for given containerID and stops OOM monitor
 func RemoveCgroup(containerID string) error {
+	oomMonitorsMutex.Lock()
+	if info, exists := oomMonitors[containerID]; exists {
+		info.cancel()
+		delete(oomMonitors, containerID)
+		oomMonitorsMutex.Unlock()
+		<-info.done
+	} else {
+		oomMonitorsMutex.Unlock()
+	}
+	
 	dir := filepath.Join(CgroupRoot, containerID)
 	return os.RemoveAll(dir)
 }
 
-func monitorOOM(dir string, pid int) {
+func monitorOOM(ctx context.Context, containerID, dir string, pid int, done chan struct{}) {
+	defer close(done)
+	
 	f, err := os.Open(filepath.Join(dir, "memory.events"))
 	if err != nil {
 		return
@@ -73,19 +103,26 @@ func monitorOOM(dir string, pid int) {
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	
 	for {
-		f.Seek(0, 0)
-		scanner = bufio.NewScanner(f)
-		for scanner.Scan() {
-			line := scanner.Text()
-			if strings.HasPrefix(line, "oom ") || strings.HasPrefix(line, "oom_kill ") {
-				fields := strings.Fields(line)
-				if len(fields) == 2 && fields[1] != "0" {
-					syscall.Kill(pid, syscall.SIGKILL)
-					return
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			f.Seek(0, 0)
+			scanner = bufio.NewScanner(f)
+			for scanner.Scan() {
+				line := scanner.Text()
+				if strings.HasPrefix(line, "oom ") || strings.HasPrefix(line, "oom_kill ") {
+					fields := strings.Fields(line)
+					if len(fields) == 2 && fields[1] != "0" {
+						syscall.Kill(pid, syscall.SIGKILL)
+						return
+					}
 				}
 			}
 		}
-		time.Sleep(1 * time.Second)
 	}
 }

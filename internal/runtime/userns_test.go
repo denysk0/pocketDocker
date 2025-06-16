@@ -31,7 +31,7 @@ func TestCloneAndRunUserNamespace(t *testing.T) {
 	}
 	t.Logf("Found /bin/sh at %s", shPath)
 
-	pid, master, unblock, err := CloneAndRun("/bin/sh", []string{"-c", "echo starting; id -u; echo done; sleep 0.5"}, rootfs)
+	pid, master, err := CloneAndRun("/bin/sh", []string{"-c", "echo starting; id -u; echo done; sleep 0.5"}, rootfs, false, true)
 	if err != nil {
 		t.Fatalf("CloneAndRun: %v", err)
 	}
@@ -41,24 +41,17 @@ func TestCloneAndRunUserNamespace(t *testing.T) {
 		}
 	}()
 	t.Logf("Created process PID=%d", pid)
-	
-	// Unblock the child process so it can proceed to exec and exit
-	// Write a byte to signal the child to continue
-	if _, err := unblock.Write([]byte{1}); err != nil {
-		t.Fatalf("Error writing to unblock pipe: %v", err)
-	}
-	if err := unblock.Close(); err != nil {
-		t.Fatalf("Error closing unblock pipe: %v", err)
-	}
-	t.Logf("Unblocked child process")
+
+	// Child process is already unblocked after uid/gid mapping is complete
+	t.Logf("Child process started and unblocked")
 
 	// Read output with timeout to prevent hanging
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	
+
 	resultCh := make(chan []byte, 1)
 	errorCh := make(chan error, 1)
-	
+
 	go func() {
 		data, err := io.ReadAll(master)
 		if err != nil {
@@ -67,7 +60,7 @@ func TestCloneAndRunUserNamespace(t *testing.T) {
 		}
 		resultCh <- data
 	}()
-	
+
 	// Check process status periodically
 	go func() {
 		for i := 0; i < 5; i++ {
@@ -79,7 +72,7 @@ func TestCloneAndRunUserNamespace(t *testing.T) {
 			t.Logf("Process %d still alive after %ds", pid, i+1)
 		}
 	}()
-	
+
 	var outBytes []byte
 	select {
 	case outBytes = <-resultCh:
@@ -94,10 +87,10 @@ func TestCloneAndRunUserNamespace(t *testing.T) {
 			t.Fatalf("timeout reading from master PTY - process %d still alive but not outputting", pid)
 		}
 	}
-	
+
 	output := string(outBytes)
 	t.Logf("Container output: %q", output)
-	
+
 	// Look for "0" in the output (from id -u command)
 	lines := strings.Split(strings.TrimSpace(output), "\n")
 	var uidLine string

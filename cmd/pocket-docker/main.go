@@ -5,6 +5,8 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"strconv"
+	"syscall"
 
 	"github.com/denysk0/pocketDocker/internal/cli"
 	"github.com/denysk0/pocketDocker/internal/store"
@@ -18,17 +20,36 @@ var rootCmd = &cobra.Command{
 }
 
 func main() {
-	// if sudo – write DB to home directory of original user
 	sudoUser := os.Getenv("SUDO_USER")
 	var home string
+	var sudoUID, sudoGID int
 	if sudoUser != "" {
-		u, _ := user.Lookup(sudoUser)
-		home = u.HomeDir
+		u, err := user.Lookup(sudoUser)
+		if err != nil {
+			home, _ = os.UserHomeDir()
+		} else {
+			home = u.HomeDir
+			if uid, err := strconv.Atoi(u.Uid); err == nil {
+				sudoUID = uid
+			} else {
+				sudoUID = os.Getuid()
+			}
+			if gid, err := strconv.Atoi(u.Gid); err == nil {
+				sudoGID = gid
+			} else {
+				sudoGID = os.Getgid()
+			}
+		}
 	} else {
 		home, _ = os.UserHomeDir()
 	}
 	dbPath := filepath.Join(home, ".pocket-docker", "state.db")
 	os.MkdirAll(filepath.Dir(dbPath), 0755)
+	
+	if os.Geteuid() == 0 && sudoUser != "" && sudoUID > 0 {
+		_ = syscall.Chown(filepath.Dir(dbPath), sudoUID, sudoGID)
+	}
+	
 	st, err := store.NewStore(dbPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "store open:", err)
@@ -37,6 +58,10 @@ func main() {
 	if err := st.Init(); err != nil {
 		fmt.Fprintln(os.Stderr, "store init:", err)
 		os.Exit(1)
+	}
+	
+	if os.Geteuid() == 0 && sudoUser != "" && sudoUID > 0 {
+		_ = syscall.Chown(dbPath, sudoUID, sudoGID)
 	}
 	defer func() {
 		if err := st.Close(); err != nil {

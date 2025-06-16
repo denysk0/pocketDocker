@@ -13,19 +13,43 @@ import (
 	"syscall"
 )
 
+type pipePair struct {
+	r *os.File
+	w *os.File
+}
+
+func (p *pipePair) Read(b []byte) (int, error) {
+	return p.r.Read(b)
+}
+
+func (p *pipePair) Write(b []byte) (int, error) {
+	if p.w == nil {
+		return 0, io.ErrClosedPipe
+	}
+	return p.w.Write(b)
+}
+
+func (p *pipePair) Close() error {
+	if err := p.r.Close(); err != nil {
+		return err
+	}
+	if p.w != nil {
+		_ = p.w.Close()
+	}
+	return nil
+}
+
+
 // SetupContainerRoot sets up a new root filesystem using chroot
 // and mounts /proc and /sys inside the new namespace.
 func SetupContainerRoot(rootfsPath string) error {
-	// Make mounts private; ignore errors if unsupported
 	_ = syscall.Mount("", "/", "", syscall.MS_PRIVATE|syscall.MS_REC, "")
 
-	// Ensure busybox httpd applet is available in rootfs
 	httpdHost := filepath.Join(rootfsPath, "bin", "httpd")
 	if _, err := os.Stat(httpdHost); os.IsNotExist(err) {
-		_ = os.Symlink("/bin/busybox", httpdHost)
+		_ = os.Symlink("busybox", httpdHost)
 	}
 
-	// Enter and chroot into the provided rootfs
 	if err := syscall.Chdir(rootfsPath); err != nil {
 		return fmt.Errorf("chdir to rootfs failed: %w", err)
 	}
@@ -33,12 +57,12 @@ func SetupContainerRoot(rootfsPath string) error {
 		return fmt.Errorf("chroot failed: %w", err)
 	}
 
-	// Mount proc filesystem
-	if err := syscall.Mount("proc", "/proc", "proc", 0, ""); err != nil && err != syscall.EPERM {
+	procFlags := syscall.MS_NOSUID | syscall.MS_NODEV | syscall.MS_NOEXEC | syscall.MS_RELATIME
+	if err := syscall.Mount("proc", "/proc", "proc", uintptr(procFlags), ""); err != nil && err != syscall.EPERM {
 		return fmt.Errorf("mount proc failed: %w", err)
 	}
-	// Mount sysfs
-	if err := syscall.Mount("sysfs", "/sys", "sysfs", 0, ""); err != nil && err != syscall.EPERM {
+	sysFlags := syscall.MS_NOSUID | syscall.MS_NODEV | syscall.MS_NOEXEC | syscall.MS_RELATIME | syscall.MS_RDONLY
+	if err := syscall.Mount("sysfs", "/sys", "sysfs", uintptr(sysFlags), ""); err != nil && err != syscall.EPERM {
 		return fmt.Errorf("mount sysfs failed: %w", err)
 	}
 	return nil
@@ -46,60 +70,121 @@ func SetupContainerRoot(rootfsPath string) error {
 
 // CloneAndRun clones the current process into new namespaces
 // then runs cmdPath with args inside the isolated environment
-func CloneAndRun(cmdPath string, args []string, rootfsPath string, interactive bool) (int, *os.File, *os.File, error) {
+func CloneAndRun(cmdPath string, args []string, rootfsPath string, interactive bool, withTTY bool) (int, io.ReadWriteCloser, error) {
 	skipSetup := os.Getenv("SKIP_SETUP") == "1"
-	// Synchronization pipe: child waits on read until parent sets up networking
 	pr, pw, err := os.Pipe()
 	if err != nil {
-		return 0, nil, nil, err
+		return 0, nil, err
 	}
-	master, slave, err := pty.Open()
-	if err != nil {
-		pr.Close()
-		pw.Close()
-		return 0, nil, nil, err
+
+	var master io.ReadWriteCloser
+	var slave *os.File
+	var stdinR, stdinW *os.File
+	var stdoutR, stdoutW *os.File
+
+	if withTTY {
+		masterFile, slaveFile, err := pty.Open()
+		if err != nil {
+			pr.Close()
+			pw.Close()
+			return 0, nil, err
+		}
+		master = masterFile
+		slave = slaveFile
+	} else {
+		stdoutR, stdoutW, err = os.Pipe()
+		if err != nil {
+			pr.Close()
+			pw.Close()
+			return 0, nil, err
+		}
+		if interactive {
+			stdinR, stdinW, err = os.Pipe()
+			if err != nil {
+				stdoutR.Close()
+				stdoutW.Close()
+				pr.Close()
+				pw.Close()
+				return 0, nil, err
+			}
+			master = &pipePair{r: stdoutR, w: stdinW}
+		} else {
+			master = &pipePair{r: stdoutR}
+		}
 	}
+
 	flags := uintptr(syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWNET | syscall.CLONE_NEWUSER | syscall.SIGCHLD)
 	pid, _, errno := syscall.RawSyscall(syscall.SYS_CLONE, flags, 0, 0)
 	if errno != 0 {
-		master.Close()
-		slave.Close()
+		if master != nil {
+			master.Close()
+		}
+		if slave != nil {
+			slave.Close()
+		}
+		if stdoutR != nil {
+			stdoutR.Close()
+		}
+		if stdoutW != nil {
+			stdoutW.Close()
+		}
+		if stdinR != nil {
+			stdinR.Close()
+		}
+		if stdinW != nil {
+			stdinW.Close()
+		}
 		pr.Close()
 		pw.Close()
-		return 0, nil, nil, errno
+		return 0, nil, errno
 	}
 	if pid == 0 {
-		masterFD := int(master.Fd())
-		unix.Close(masterFD)
-		slaveFD := int(slave.Fd())
-		// Child: close write end and wait for parent to finish SetupNetworking
-		unix.Close(int(pw.Fd()))
-
-		// Wait until the parent either closes the pipe or writes a single byte.
-		buf := make([]byte, 1)
-		_, _ = unix.Read(int(pr.Fd()), buf)
-		unix.Close(int(pr.Fd()))
-
-		// Create new session and set the slave PTY as controlling terminal
-		if _, err := unix.Setsid(); err != nil {
-			unix.Write(2, []byte(fmt.Sprintf("setsid error: %v\n", err)))
-			syscall.Exit(1)
+		if master != nil {
+			if f, ok := master.(*os.File); ok {
+				unix.Close(int(f.Fd()))
+			}
 		}
-		if err := unix.IoctlSetPointerInt(slaveFD, unix.TIOCSCTTY, 0); err != nil {
-			unix.Write(2, []byte(fmt.Sprintf("setctty error: %v\n", err)))
-			syscall.Exit(1)
+		if slave != nil {
+			slaveFD := int(slave.Fd())
+			unix.Close(int(pw.Fd()))
+
+			buf := make([]byte, 1)
+			_, _ = unix.Read(int(pr.Fd()), buf)
+			unix.Close(int(pr.Fd()))
+
+			if _, err := unix.Setsid(); err != nil {
+				unix.Write(2, []byte(fmt.Sprintf("setsid error: %v\n", err)))
+				syscall.Exit(1)
+			}
+			if err := unix.IoctlSetPointerInt(slaveFD, unix.TIOCSCTTY, 0); err != nil {
+				unix.Write(2, []byte(fmt.Sprintf("setctty error: %v\n", err)))
+				syscall.Exit(1)
+			}
+			unix.Dup2(slaveFD, 0)
+			unix.Dup2(slaveFD, 1)
+			unix.Dup2(slaveFD, 2)
+			unix.Close(slaveFD)
+		} else {
+			unix.Close(int(pw.Fd()))
+			buf := make([]byte, 1)
+			_, _ = unix.Read(int(pr.Fd()), buf)
+			unix.Close(int(pr.Fd()))
+
+			if interactive {
+				unix.Dup2(int(stdinR.Fd()), 0)
+				unix.Close(int(stdinR.Fd()))
+			} else {
+				fd, _ := unix.Open("/dev/null", unix.O_RDONLY, 0)
+				unix.Dup2(fd, 0)
+				unix.Close(fd)
+			}
+			unix.Dup2(int(stdoutW.Fd()), 1)
+			unix.Dup2(int(stdoutW.Fd()), 2)
+			unix.Close(int(stdoutW.Fd()))
 		}
 
-		// Redirect stdin, stdout, and stderr to the slave PTY
-		unix.Dup2(slaveFD, 0)
-		unix.Dup2(slaveFD, 1)
-		unix.Dup2(slaveFD, 2)
-		unix.Close(slaveFD)
-
-		// Skip filesystem setup when testing user namespace only
 		if !skipSetup {
 			if err := SetupContainerRoot(rootfsPath); err != nil {
-				// report detailed setup error
 				msg := fmt.Sprintf("setup error: %v\n", err)
 				unix.Write(2, []byte(msg))
 				syscall.Exit(1)
@@ -115,42 +200,106 @@ func CloneAndRun(cmdPath string, args []string, rootfsPath string, interactive b
 	gid := os.Getgid()
 	uidMap := fmt.Sprintf("0 %d 1\n", uid)
 	gidMap := fmt.Sprintf("0 %d 1\n", gid)
-	if err := os.WriteFile(fmt.Sprintf("/proc/%d/uid_map", pid), []byte(uidMap), 0644); err != nil {
-		master.Close()
-		slave.Close()
+	
+	if err := os.WriteFile(fmt.Sprintf("/proc/%d/setgroups", pid), []byte("deny"), 0644); err != nil {
+		if master != nil {
+			master.Close()
+		}
+		if slave != nil {
+			slave.Close()
+		}
+		if stdoutR != nil {
+			stdoutR.Close()
+		}
+		if stdoutW != nil {
+			stdoutW.Close()
+		}
+		if stdinR != nil {
+			stdinR.Close()
+		}
+		if stdinW != nil {
+			stdinW.Close()
+		}
 		pr.Close()
 		pw.Close()
-		return 0, nil, nil, err
+		return 0, nil, err
 	}
-	_ = os.WriteFile(fmt.Sprintf("/proc/%d/setgroups", pid), []byte("deny"), 0644)
+	
 	if err := os.WriteFile(fmt.Sprintf("/proc/%d/gid_map", pid), []byte(gidMap), 0644); err != nil {
-		master.Close()
-		slave.Close()
+		if master != nil {
+			master.Close()
+		}
+		if slave != nil {
+			slave.Close()
+		}
+		if stdoutR != nil {
+			stdoutR.Close()
+		}
+		if stdoutW != nil {
+			stdoutW.Close()
+		}
+		if stdinR != nil {
+			stdinR.Close()
+		}
+		if stdinW != nil {
+			stdinW.Close()
+		}
 		pr.Close()
 		pw.Close()
-		return 0, nil, nil, err
+		return 0, nil, err
 	}
-	// Keep collecting PTY output but present it via a plain pipe so that
-	// readers see clean EOF instead of the EIO that Linux returns on PTY
-	// masters when the slave side disappears.
-	slave.Close()
+	
+	if err := os.WriteFile(fmt.Sprintf("/proc/%d/uid_map", pid), []byte(uidMap), 0644); err != nil {
+		if master != nil {
+			master.Close()
+		}
+		if slave != nil {
+			slave.Close()
+		}
+		if stdoutR != nil {
+			stdoutR.Close()
+		}
+		if stdoutW != nil {
+			stdoutW.Close()
+		}
+		if stdinR != nil {
+			stdinR.Close()
+		}
+		if stdinW != nil {
+			stdinW.Close()
+		}
+		pr.Close()
+		pw.Close()
+		return 0, nil, err
+	}
+
+	if withTTY {
+		if slave != nil {
+			slave.Close()
+		}
+	} else {
+		if stdoutW != nil {
+			stdoutW.Close()
+		}
+		if stdinR != nil {
+			stdinR.Close()
+		}
+	}
 	pr.Close()
+	pw.Close()
 
-	// If interactive mode – return the raw PTY master so the caller can both
-	// write (stdin) and read (stdout) from it.
 	if interactive {
-		return int(pid), master, pw, nil
+		return int(pid), master, nil
 	}
 
-	// Non‑interactive: create a pipe so callers see clean EOF instead of EIO.
 	if rdr, wtr, errPipe := os.Pipe(); errPipe == nil {
 		go func() {
-			_, _ = io.Copy(wtr, master) // copy until PTY closes
-			master.Close()              // close original PTY master
-			wtr.Close()                 // signal EOF to readers
+			_, _ = io.Copy(wtr, master)
+			master.Close()
+			wtr.Close()
 		}()
-		return int(pid), rdr, pw, nil
+		return int(pid), rdr, nil
 	}
-	// Fallback
-	return int(pid), master, pw, nil
+
+	return int(pid), master, nil
 }

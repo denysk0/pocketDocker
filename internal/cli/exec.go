@@ -40,7 +40,6 @@ func execRun(cmd *cobra.Command, args []string) error {
 	if info.State != "Running" {
 		return fmt.Errorf("container not running")
 	}
-	// Double-check the PID is still alive; update state if it's gone
 	if err := syscall.Kill(info.PID, 0); err == syscall.ESRCH {
 		_ = st.UpdateContainerState(id, "Stopped")
 		return fmt.Errorf("container not running (PID %d not found)", info.PID)

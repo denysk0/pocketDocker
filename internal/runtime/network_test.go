@@ -14,10 +14,16 @@ func (f *fakeNetRunner) Run(cmd string, args ...string) error {
 	return nil
 }
 
+type mockIptablesChecker struct{}
+
+func (mockIptablesChecker) CheckRule(args ...string) bool {
+	return false
+}
+
 func TestSetupNetworkingCommands(t *testing.T) {
 	f := &fakeNetRunner{}
 	ports := []PortMap{{Host: 8080, Container: 80}}
-	err := SetupNetworking(123, "abcdef0123456789", ports, f)
+	_, _, err := SetupNetworkingWithChecker(123, "abcdef0123456789", ports, f, mockIptablesChecker{})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -4,6 +4,7 @@ import (
 	"github.com/denysk0/pocketDocker/internal/runtime/cgroups"
 	"github.com/denysk0/pocketDocker/internal/store"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -14,28 +15,28 @@ import (
 // Cleanup stops the container process and removes its resources.
 func Cleanup(info store.ContainerInfo) {
 	if proc, err := os.FindProcess(info.PID); err == nil {
-		_ = proc.Signal(syscall.SIGTERM)
+		if err := proc.Signal(syscall.SIGTERM); err != nil && err != syscall.ESRCH {
+		}
 		time.Sleep(5 * time.Second)
-		_ = proc.Signal(syscall.SIGKILL)
+		if err := proc.Signal(syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+		}
 	}
 	_ = cgroups.RemoveCgroup(info.ID)
-	// cleanup networking resources
-	if info.Ports != "" {
+	if info.NetworkSetup {
 		var pm []PortMap
-		for _, p := range strings.Split(info.Ports, ",") {
-			parts := strings.SplitN(p, ":", 2)
-			if len(parts) == 2 {
-				hostPort, err1 := strconv.Atoi(parts[0])
-				contPort, err2 := strconv.Atoi(parts[1])
-				if err1 == nil && err2 == nil {
-					pm = append(pm, PortMap{Host: hostPort, Container: contPort})
+		if info.Ports != "" {
+			for _, p := range strings.Split(info.Ports, ",") {
+				parts := strings.SplitN(p, ":", 2)
+				if len(parts) == 2 {
+					hostPort, err1 := strconv.Atoi(parts[0])
+					contPort, err2 := strconv.Atoi(parts[1])
+					if err1 == nil && err2 == nil {
+						pm = append(pm, PortMap{Host: hostPort, Container: contPort})
+					}
 				}
 			}
 		}
-		_ = CleanupNetworking(info.ID, pm)
-	} else {
-		// delete veth even if no ports were published
-		_ = CleanupNetworking(info.ID, nil)
+		_ = CleanupNetworkingWithIPSuffix(info.ID, info.IPSuffix, pm, info.IpForwardOrig)
 	}
 	if info.RootfsDir != "" {
 		_ = syscall.Unmount(filepath.Join(info.RootfsDir, "proc"), syscall.MNT_DETACH)
@@ -48,5 +49,14 @@ func Cleanup(info store.ContainerInfo) {
 			return nil
 		})
 		_ = os.RemoveAll(info.RootfsDir)
+	}
+	home := os.Getenv("HOME")
+	if home == "" {
+		if u, err := user.Current(); err == nil {
+			home = u.HomeDir
+		}
+	}
+	if home != "" {
+		_ = os.Remove(filepath.Join(home, ".pocket-docker", "logs", info.ID+".log"))
 	}
 }

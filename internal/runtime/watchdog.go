@@ -1,9 +1,13 @@
+//go:build linux
+
 package runtime
 
 import (
 	"context"
+	"log"
 	"os/exec"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -27,9 +31,28 @@ func StartWatchdog(ctx context.Context, pid int, interval time.Duration, healthC
 					}
 					continue
 				}
-				cmd := exec.Command("nsenter", "--target", strconv.Itoa(pid), "--pid", "--mount")
-				cmd.Args = append(cmd.Args, "sh", "-c", healthCmd)
-				if err := cmd.Run(); err != nil {
+				var cmd *exec.Cmd
+				needsShell := strings.ContainsAny(healthCmd, "|&;<>()$`\\\"'")
+				
+				if needsShell {
+					cmd = exec.Command("nsenter", "--target", strconv.Itoa(pid),
+						"--pid", "--mount", "--uts", "--ipc", "--net",
+						"--", "sh", "-c", healthCmd)
+				} else {
+					parts := strings.Fields(healthCmd)
+					if len(parts) == 0 {
+						failCh <- struct{}{}
+						return
+					}
+					nsenterArgs := []string{"--target", strconv.Itoa(pid),
+						"--pid", "--mount", "--uts", "--ipc", "--net", "--"}
+					nsenterArgs = append(nsenterArgs, parts...)
+					cmd = exec.Command("nsenter", nsenterArgs...)
+				}
+				
+				out, err := cmd.CombinedOutput()
+				if err != nil {
+					log.Printf("health check failed: %v, output: %s", err, string(out))
 					failCh <- struct{}{}
 					return
 				}

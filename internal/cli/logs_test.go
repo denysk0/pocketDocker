@@ -12,7 +12,7 @@ import (
 
 func TestLogsCmdPrint(t *testing.T) {
 	tmp := t.TempDir()
-	os.Setenv("HOME", tmp)
+	t.Setenv("HOME", tmp)
 	os.Unsetenv("SUDO_USER")
 	logDir := filepath.Join(tmp, ".pocket-docker", "logs")
 	os.MkdirAll(logDir, 0755)
@@ -37,7 +37,7 @@ func TestLogsCmdPrint(t *testing.T) {
 
 func TestLogsCmdFollow(t *testing.T) {
 	tmp := t.TempDir()
-	os.Setenv("HOME", tmp)
+	t.Setenv("HOME", tmp)
 	os.Unsetenv("SUDO_USER")
 	logDir := filepath.Join(tmp, ".pocket-docker", "logs")
 	os.MkdirAll(logDir, 0755)

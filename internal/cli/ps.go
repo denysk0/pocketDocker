@@ -17,8 +17,13 @@ func processExists(pid int) bool {
 		return false
 	}
 	err := syscall.Kill(pid, 0)
-	if err == nil || err == syscall.EPERM {
+	if err == nil {
 		return true
+	}
+	if err == syscall.EPERM {
+		if _, statErr := os.Stat(fmt.Sprintf("/proc/%d", pid)); statErr == nil {
+			return true
+		}
 	}
 	return false
 }

@@ -46,9 +46,13 @@ func prepareRootfs(src string) (string, error) {
 		if err := cmd2.Start(); err != nil {
 			return "", err
 		}
-		_ = cmd1.Wait()
+		if err := cmd1.Wait(); err != nil {
+			return "", err
+		}
 		w.Close()
-		_ = cmd2.Wait()
+		if err := cmd2.Wait(); err != nil {
+			return "", err
+		}
 	} else {
 		tarCmd := exec.Command("tar", "-xf", src, "-C", dir)
 		tarCmd.Stdout = os.Stdout
@@ -79,16 +83,28 @@ var RunCmd = &cobra.Command{
 	Use:   "run",
 	Short: "run a container",
 	Run: func(cmd *cobra.Command, args []string) {
-		var pr io.ReadCloser
+		var (
+			pr       io.ReadCloser
+			oldState *term.State
+			rawSet   bool
+		)
+		defer func() {
+			if rawSet {
+				_ = term.Restore(int(os.Stdin.Fd()), oldState)
+			}
+		}()
 		if interactive && detach {
 			fmt.Fprintln(os.Stderr, "cannot combine --interactive (-i) with --detach (-d)")
+			os.Exit(1)
+		}
+		if tty && detach {
+			fmt.Fprintln(os.Stderr, "cannot combine --tty (-t) with --detach (-d)")
 			os.Exit(1)
 		}
 		if rootfs == "" || command == "" {
 			fmt.Fprintln(os.Stderr, "both --rootfs and --cmd flags are required")
 			os.Exit(1)
 		}
-		// if rootfs is just a name, try lookup in image cache
 		if !strings.Contains(rootfs, "/") && !strings.HasSuffix(rootfs, ".tar") {
 			if st := getStore(); st != nil {
 				if img, err := st.GetImage(rootfs); err == nil {
@@ -118,11 +134,12 @@ var RunCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		// binary := parts[0]
 		name := strings.TrimSuffix(filepath.Base(rootfs), filepath.Ext(rootfs))
 
 		restartCount := 0
 		printedID := false
+		var ipForwardOrig string
+		var ipSuffix int
 		for {
 			rootfsDir, err := prepareRootfs(rootfs)
 			if err != nil {
@@ -145,30 +162,43 @@ var RunCmd = &cobra.Command{
 				}
 			}
 
-			// If interactive, put host terminal into raw mode so input is forwarded correctly
-			if interactive {
+			if interactive && !rawSet {
 				fd := int(os.Stdin.Fd())
 				if term.IsTerminal(fd) {
-					oldState, err := term.MakeRaw(fd)
+					var err error
+					oldState, err = term.MakeRaw(fd)
 					if err != nil {
 						fmt.Fprintf(os.Stderr, "warning: failed to set raw mode: %v\n", err)
 					} else {
-						defer term.Restore(fd, oldState)
+						rawSet = true
 					}
 				}
 			}
 
-			pid, master, unblock, err := runtime.CloneAndRun(cmdPath, parts[1:], rootfsDir, interactive)
+			pid, master, err := runtime.CloneAndRun(cmdPath, parts[1:], rootfsDir, interactive, tty)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "failed to run command: %v\n", err)
 				os.Exit(1)
 			}
+			
+			ctx, cancel := context.WithCancel(context.Background())
+			
 			if interactive {
-				// Directly wire host stdin/stdout to the container's PTY master.
-				go func() { _, _ = io.Copy(master, os.Stdin) }()
+				go func() {
+					defer func() { 
+						if master != nil {
+							master.Close()
+						}
+					}()
+					select {
+					case <-ctx.Done():
+						return
+					default:
+						_, _ = io.Copy(master, os.Stdin)
+					}
+				}()
 				go func() { _, _ = io.Copy(os.Stdout, master) }()
 			} else {
-				// Non-interactive: attach to logs for recording and streaming
 				if master != nil {
 					var errAttach error
 					pr, errAttach = logging.Attach(id, master)
@@ -176,7 +206,6 @@ var RunCmd = &cobra.Command{
 						fmt.Fprintf(os.Stderr, "failed to attach logs: %v\n", errAttach)
 					}
 				}
-				// Stream log output to stdout
 				if pr != nil {
 					go func() { _, _ = io.Copy(os.Stdout, pr) }()
 				}
@@ -211,15 +240,12 @@ var RunCmd = &cobra.Command{
 					}
 					pm = append(pm, runtime.PortMap{Host: hp, Container: cp})
 				}
-				if err := runtime.SetupNetworking(pid, id, pm, nil); err != nil {
+				ipForwardOrig, ipSuffix, err = runtime.SetupNetworking(pid, id, pm, nil)
+				if err != nil {
 					fmt.Fprintf(os.Stderr, "network setup failed: %v\n", err)
 					os.Exit(1)
 				}
-				// Networking ready — unblock child so it can exec its command
-				unblock.Close()
 			} else {
-				// No networking: unblock child immediately
-				unblock.Close()
 			}
 
 			info := store.ContainerInfo{
@@ -235,6 +261,9 @@ var RunCmd = &cobra.Command{
 				HealthInterval: healthInterval,
 				RestartMax:     restartMax,
 				Ports:          strings.Join(publish, ","),
+				IpForwardOrig:  ipForwardOrig,
+				NetworkSetup:   enableNet || len(publish) > 0,
+				IPSuffix:       ipSuffix,
 			}
 			st := getStore()
 			if st != nil {
@@ -244,12 +273,31 @@ var RunCmd = &cobra.Command{
 				fmt.Println(id)
 				printedID = true
 			}
-			// If detached, exit immediately after printing ID
 			if detach {
+				go func() {
+					var ws syscall.WaitStatus
+					syscall.Wait4(pid, &ws, 0, nil)
+					
+					if st := getStore(); st != nil {
+						info.State = "Stopped"
+						_ = st.SaveContainer(info)
+					}
+					runtime.Cleanup(info)
+				}()
 				return
 			}
 
-			ctx, cancel := context.WithCancel(context.Background())
+			if pr != nil && master != nil {
+				pr.Close() // Close the old reader
+				var errAttach error
+				pr, errAttach = logging.AttachWithContext(ctx, id, master)
+				if errAttach != nil {
+					fmt.Fprintf(os.Stderr, "failed to re-attach logs with context: %v\n", errAttach)
+				} else {
+					go func() { _, _ = io.Copy(os.Stdout, pr) }()
+				}
+			}
+			
 			failCh := make(chan struct{}, 1)
 			interval := time.Duration(healthInterval) * time.Second
 			if interval <= 0 {
@@ -264,12 +312,10 @@ var RunCmd = &cobra.Command{
 				close(exitCh)
 			}()
 
-			// Ждём либо падения health-check, либо обычного завершения процесса
 			select {
 			case <-failCh:
 				logging.Append(id, "FAILED health-check")
 			case <-exitCh:
-				// normal or error exit
 			}
 
 			cancel()
@@ -280,12 +326,11 @@ var RunCmd = &cobra.Command{
 				pr = nil
 			}
 
-			// --- решаем, перезапускать ли контейнер ---
 			shouldRestart := false
 			if restartMax == -1 {
-				shouldRestart = true // «бесконечно»
+				shouldRestart = true
 			} else if restartMax > 0 && restartCount < restartMax {
-				shouldRestart = true // в рамках лимита
+				shouldRestart = true
 			}
 
 			if !shouldRestart {
@@ -293,11 +338,15 @@ var RunCmd = &cobra.Command{
 					info.State = "Stopped"
 					_ = st.SaveContainer(info)
 				}
+				cancel()
 				return
 			}
 
 			restartCount++
 			logging.Append(id, fmt.Sprintf("Restart #%d …", restartCount))
+		}
+		if rawSet {
+			term.Restore(int(os.Stdin.Fd()), oldState)
 		}
 	},
 }
@@ -314,7 +363,7 @@ func init() {
 	RunCmd.Flags().IntVar(&restartMax, "restart-max", 0, "max restarts (0 = no restarts, −1 = unlimited)")
 	RunCmd.Flags().BoolVarP(&detach, "detach", "d", false, "run container in background")
 	RunCmd.Flags().BoolVarP(&interactive, "interactive", "i", false, "keep stdin open (forward host STDIN)")
-	RunCmd.Flags().BoolVarP(&tty, "tty", "t", false, "allocate a pseudo‑TTY (enabled by default)")
+	RunCmd.Flags().BoolVarP(&tty, "tty", "t", false, "allocate a pseudo‑TTY")
 	err := RunCmd.MarkFlagRequired("rootfs")
 	if err != nil {
 		return

@@ -17,8 +17,9 @@ func TestAttach(t *testing.T) {
 	defer master.Close()
 	defer slave.Close()
 
-	home, _ := os.UserHomeDir()
-	logDir := filepath.Join(home, ".pocket-docker", "logs")
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	logDir := filepath.Join(tmp, ".pocket-docker", "logs")
 	os.RemoveAll(logDir)
 
 	r, err := Attach("testid", master)

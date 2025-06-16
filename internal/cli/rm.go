@@ -47,8 +47,15 @@ var RmCmd = &cobra.Command{
 		}
 
 		for _, id := range ids {
-			// Trim any whitespace around the ID
-			id = strings.TrimSpace(id)
+			// Normalize ID by trimming all types of whitespace including \n, \r, \t
+			id = strings.Trim(strings.TrimSpace(id), "\n\r\t")
+			info, err := st.GetContainer(id)
+			if err == nil {
+				if info.State == "Running" {
+					fmt.Fprintf(os.Stderr, "container %s is still running – stop it first\n", id)
+					continue
+				}
+			}
 			if err := st.DeleteContainer(id); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to remove container %s: %v\n", id, err)
 				continue

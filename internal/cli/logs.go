@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/user"
 	"path/filepath"
 	"time"
 
+	"github.com/denysk0/pocketDocker/internal/util"
 	"github.com/spf13/cobra"
 )
 
@@ -40,7 +40,7 @@ func logsRun(cmd *cobra.Command, args []string) {
 			os.Exit(1)
 		}
 	}
-	home := userHomeDir()
+	home := util.UserHomeDir()
 	path := filepath.Join(home, ".pocket-docker", "logs", id+".log")
 	f, err := os.Open(path)
 	if err != nil {
@@ -59,28 +59,64 @@ func logsRun(cmd *cobra.Command, args []string) {
 		}
 		return
 	}
-	data, err := io.ReadAll(f)
-	if err != nil {
-		fmt.Fprintln(errOut, "read log:", err)
-		os.Exit(1)
-	}
-	lines := bytes.Split(data, []byte("\n"))
-	if tailLines > 0 && len(lines) > tailLines {
-		lines = lines[len(lines)-tailLines:]
-	}
-	outBytes := bytes.Join(lines, []byte("\n"))
-	if len(outBytes) > 0 {
-		if !bytes.HasSuffix(outBytes, []byte("\n")) {
-			outBytes = append(outBytes, '\n')
+	if tailLines != 0 {
+		const chunk = 4096
+		var (
+			totalSize int64
+			buf       []byte
+			nlCount   int
+		)
+		if fi, err := f.Stat(); err == nil {
+			totalSize = fi.Size()
 		}
-		out.Write(outBytes)
+		offset := int64(0)
+		for totalSize+offset > 0 && nlCount <= tailLines {
+			step := chunk
+			if -offset-int64(step) < 0 {
+				step = int(totalSize + offset)
+			}
+			offset -= int64(step)
+			if _, err := f.Seek(offset, io.SeekEnd); err != nil {
+				break
+			}
+			tmp := make([]byte, step)
+			n, _ := f.Read(tmp)
+			buf = append(tmp[:n], buf...)
+			for i := n - 1; i >= 0; i-- {
+				if tmp[i] == '\n' {
+					nlCount++
+					if nlCount > tailLines {
+						start := i + 1
+						if i > 0 && tmp[i-1] == '\r' {
+							start = i
+						}
+						buf = buf[start:]
+						break
+					}
+				}
+			}
+		}
+		if len(buf) > 0 && !bytes.HasSuffix(buf, []byte("\n")) {
+			buf = append(buf, '\n')
+		}
+		out.Write(buf)
+	} else {
+		if _, err := f.Seek(0, 0); err == nil {
+			io.Copy(out, f)
+		}
 	}
 	ctx := cmd.Context()
+	sleepDuration := 50 * time.Millisecond
+	maxSleepDuration := 1 * time.Second
+	consecutiveEOFs := 0
+	
 	for {
 		buf := make([]byte, 1024)
 		n, err := f.Read(buf)
 		if n > 0 {
 			out.Write(buf[:n])
+			sleepDuration = 50 * time.Millisecond
+			consecutiveEOFs = 0
 		}
 		if err != nil {
 			if err == io.EOF {
@@ -89,7 +125,16 @@ func logsRun(cmd *cobra.Command, args []string) {
 					return
 				default:
 				}
-				time.Sleep(50 * time.Millisecond)
+				consecutiveEOFs++
+				
+				if consecutiveEOFs > 3 {
+					sleepDuration *= 2
+					if sleepDuration > maxSleepDuration {
+						sleepDuration = maxSleepDuration
+					}
+				}
+				
+				time.Sleep(sleepDuration)
 				continue
 			}
 			fmt.Fprintln(errOut, "read log:", err)
@@ -98,15 +143,3 @@ func logsRun(cmd *cobra.Command, args []string) {
 	}
 }
 
-func userHomeDir() string {
-	if home := os.Getenv("HOME"); home != "" {
-		return home
-	}
-	if sudo := os.Getenv("SUDO_USER"); sudo != "" {
-		if u, err := user.Lookup(sudo); err == nil {
-			return u.HomeDir
-		}
-	}
-	home, _ := os.UserHomeDir()
-	return home
-}

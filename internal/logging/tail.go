@@ -2,18 +2,27 @@ package logging
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"os"
-	"os/user"
 	"path/filepath"
 	"strconv"
 	"syscall"
+
+	"github.com/denysk0/pocketDocker/internal/util"
 )
 
 // Attach reads data from r and writes it to the container log file.
 // It returns a reader that receives the same data stream.
 func Attach(id string, r io.Reader) (io.ReadCloser, error) {
-	home := userHomeDir()
+	return AttachWithContext(context.Background(), id, r)
+}
+
+// AttachWithContext reads data from r and writes it to the container log file.
+// It returns a reader that receives the same data stream.
+// The goroutine can be cancelled via the provided context.
+func AttachWithContext(ctx context.Context, id string, r io.Reader) (io.ReadCloser, error) {
+	home := util.UserHomeDir()
 	logDir := filepath.Join(home, ".pocket-docker", "logs")
 	if err := os.MkdirAll(logDir, 0755); err != nil {
 		return nil, err
@@ -21,7 +30,7 @@ func Attach(id string, r io.Reader) (io.ReadCloser, error) {
 	// If we are running as root (e.g. via sudo) ensure the directory is owned by the
 	// original user so that non‑sudo commands can read the logs later.
 	if os.Geteuid() == 0 {
-		if u := sudoUserInfo(); u != nil {
+		if u := util.SudoUserInfo(); u != nil {
 			uid, _ := strconv.Atoi(u.Uid)
 			gid, _ := strconv.Atoi(u.Gid)
 			_ = syscall.Chown(logDir, uid, gid)
@@ -33,7 +42,7 @@ func Attach(id string, r io.Reader) (io.ReadCloser, error) {
 		return nil, err
 	}
 	if os.Geteuid() == 0 {
-		if u := sudoUserInfo(); u != nil {
+		if u := util.SudoUserInfo(); u != nil {
 			uid, _ := strconv.Atoi(u.Uid)
 			gid, _ := strconv.Atoi(u.Gid)
 			_ = syscall.Chown(logPath, uid, gid)
@@ -44,7 +53,16 @@ func Attach(id string, r io.Reader) (io.ReadCloser, error) {
 		defer f.Close()
 		defer pw.Close()
 		buf := make([]byte, 4096)
+		
 		for {
+			// Check if context is cancelled before reading
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			
+			// Blocking read with larger buffer
 			n, err := r.Read(buf)
 			if n > 0 {
 				// Strip carriage returns to normalise newlines
@@ -54,6 +72,7 @@ func Attach(id string, r io.Reader) (io.ReadCloser, error) {
 				}
 			}
 			if err != nil {
+				// Error or EOF, exit goroutine
 				return
 			}
 		}
@@ -61,32 +80,9 @@ func Attach(id string, r io.Reader) (io.ReadCloser, error) {
 	return pr, nil
 }
 
-func userHomeDir() string {
-	if home := os.Getenv("HOME"); home != "" {
-		return home
-	}
-	if sudo := os.Getenv("SUDO_USER"); sudo != "" {
-		if u, err := user.Lookup(sudo); err == nil {
-			return u.HomeDir
-		}
-	}
-	home, _ := os.UserHomeDir()
-	return home
-}
-
-func sudoUserInfo() *user.User {
-	sudo := os.Getenv("SUDO_USER")
-	if sudo != "" {
-		if u, err := user.Lookup(sudo); err == nil {
-			return u
-		}
-	}
-	return nil
-}
-
 // Append writes a single line to the log file for container id.
 func Append(id, line string) {
-	home := userHomeDir()
+	home := util.UserHomeDir()
 	logDir := filepath.Join(home, ".pocket-docker", "logs")
 	os.MkdirAll(logDir, 0755)
 	logPath := filepath.Join(logDir, id+".log")

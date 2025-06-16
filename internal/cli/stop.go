@@ -19,8 +19,13 @@ var StopCmd = &cobra.Command{
 	Short: "Stop a container and remove its cgroup",
 	Run: func(cmd *cobra.Command, args []string) {
 		var ids []string
+		st := getStore()
+		if st == nil {
+			fmt.Fprintln(os.Stderr, "store not initialized")
+			return
+		}
 		if stopAll {
-			list, err := getStore().ListContainers()
+			list, err := st.ListContainers()
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "failed to list containers:", err)
 				os.Exit(1)
@@ -40,14 +45,8 @@ var StopCmd = &cobra.Command{
 			ids = []string{args[0]}
 		}
 
-		st := getStore()
-		if st == nil {
-			fmt.Fprintln(os.Stderr, "store not initialized")
-			return
-		}
 		for _, id := range ids {
-			// Trim any whitespace around the ID
-			id = strings.TrimSpace(id)
+			id = strings.Trim(strings.TrimSpace(id), "\n\r\t")
 			info, err := st.GetContainer(id)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "unknown container")
