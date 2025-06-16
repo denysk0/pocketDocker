@@ -10,10 +10,9 @@
 bin/
 _build/
 pkg/
+/pocket-docker
 
 # Go modules
-/go.sum
-/go.mod
 vendor/
 
 # SQLite database file (если используешь локально)
@@ -75,3 +74,6 @@ test-results.xml
 # Lint / tool caches
 *.cache
 .mypy_cache/
+
+
+sync_to_ubuntu.sh
