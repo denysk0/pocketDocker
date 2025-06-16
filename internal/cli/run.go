@@ -20,6 +20,7 @@ import (
 
 	"github.com/denysk0/pocketDocker/internal/store"
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 )
 
 func prepareRootfs(src string) (string, error) {
@@ -70,6 +71,8 @@ var (
 	healthInterval int
 	restartMax     int
 	detach         bool
+	interactive    bool
+	tty            bool
 )
 
 var RunCmd = &cobra.Command{
@@ -77,6 +80,10 @@ var RunCmd = &cobra.Command{
 	Short: "run a container",
 	Run: func(cmd *cobra.Command, args []string) {
 		var pr io.ReadCloser
+		if interactive && detach {
+			fmt.Fprintln(os.Stderr, "cannot combine --interactive (-i) with --detach (-d)")
+			os.Exit(1)
+		}
 		if rootfs == "" || command == "" {
 			fmt.Fprintln(os.Stderr, "both --rootfs and --cmd flags are required")
 			os.Exit(1)
@@ -111,10 +118,7 @@ var RunCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		binary := parts[0]
-		if !strings.Contains(binary, "/") {
-			binary = "/bin/" + binary
-		}
+		// binary := parts[0]
 		name := strings.TrimSuffix(filepath.Base(rootfs), filepath.Ext(rootfs))
 
 		restartCount := 0
@@ -125,17 +129,56 @@ var RunCmd = &cobra.Command{
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
 			}
+			// Resolve the real path of the binary *inside* the extracted rootfs.
+			cmdPath := parts[0]
+			if !strings.Contains(cmdPath, "/") {
+				candidates := []string{
+					filepath.Join("/bin", cmdPath),
+					filepath.Join("/usr/bin", cmdPath),
+					filepath.Join("/usr/local/bin", cmdPath),
+				}
+				for _, c := range candidates {
+					if _, err := os.Stat(filepath.Join(rootfsDir, c)); err == nil {
+						cmdPath = c
+						break
+					}
+				}
+			}
 
-			pid, master, unblock, err := runtime.CloneAndRun(binary, parts[1:], rootfsDir)
+			// If interactive, put host terminal into raw mode so input is forwarded correctly
+			if interactive {
+				fd := int(os.Stdin.Fd())
+				if term.IsTerminal(fd) {
+					oldState, err := term.MakeRaw(fd)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "warning: failed to set raw mode: %v\n", err)
+					} else {
+						defer term.Restore(fd, oldState)
+					}
+				}
+			}
+
+			pid, master, unblock, err := runtime.CloneAndRun(cmdPath, parts[1:], rootfsDir, interactive)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "failed to run command: %v\n", err)
 				os.Exit(1)
 			}
-			if master != nil {
-				var errAttach error
-				pr, errAttach = logging.Attach(id, master)
-				if errAttach != nil {
-					fmt.Fprintf(os.Stderr, "failed to attach logs: %v\n", errAttach)
+			if interactive {
+				// Directly wire host stdin/stdout to the container's PTY master.
+				go func() { _, _ = io.Copy(master, os.Stdin) }()
+				go func() { _, _ = io.Copy(os.Stdout, master) }()
+			} else {
+				// Non-interactive: attach to logs for recording and streaming
+				if master != nil {
+					var errAttach error
+					pr, errAttach = logging.Attach(id, master)
+					if errAttach != nil {
+						fmt.Fprintf(os.Stderr, "failed to attach logs: %v\n", errAttach)
+					}
+				}
+				// Stream log output to stdout
+				if pr != nil {
+					go func() { _, _ = io.Copy(os.Stdout, pr) }()
 				}
 			}
 
@@ -221,15 +264,12 @@ var RunCmd = &cobra.Command{
 				close(exitCh)
 			}()
 
-			// Wait for either a health-check failure or process exit
+			// Ждём либо падения health-check, либо обычного завершения процесса
 			select {
 			case <-failCh:
 				logging.Append(id, "FAILED health-check")
 			case <-exitCh:
-				// container exited (normal or error), treat as failure if under restart limit
-				if restartMax > 0 && restartCount < restartMax {
-					logging.Append(id, "FAILED health-check")
-				}
+				// normal or error exit
 			}
 
 			cancel()
@@ -240,23 +280,24 @@ var RunCmd = &cobra.Command{
 				pr = nil
 			}
 
-			if restartMax > 0 && restartCount >= restartMax {
+			// --- решаем, перезапускать ли контейнер ---
+			shouldRestart := false
+			if restartMax == -1 {
+				shouldRestart = true // «бесконечно»
+			} else if restartMax > 0 && restartCount < restartMax {
+				shouldRestart = true // в рамках лимита
+			}
+
+			if !shouldRestart {
 				if st != nil {
 					info.State = "Stopped"
-					st.SaveContainer(info)
-				}
-				return
-			} else if restartMax == 0 {
-				// No restarts allowed, exit loop after first run
-				if st != nil {
-					info.State = "Stopped"
-					st.SaveContainer(info)
+					_ = st.SaveContainer(info)
 				}
 				return
 			}
 
 			restartCount++
-			logging.Append(id, fmt.Sprintf("Restart #%d ...", restartCount))
+			logging.Append(id, fmt.Sprintf("Restart #%d …", restartCount))
 		}
 	},
 }
@@ -270,8 +311,10 @@ func init() {
 	RunCmd.Flags().BoolVar(&enableNet, "network", false, "enable networking namespace")
 	RunCmd.Flags().StringVar(&healthCmd, "health-cmd", "", "health check command")
 	RunCmd.Flags().IntVar(&healthInterval, "health-interval", 30, "health check interval seconds")
-	RunCmd.Flags().IntVar(&restartMax, "restart-max", 0, "max restarts (0 = unlimited)")
+	RunCmd.Flags().IntVar(&restartMax, "restart-max", 0, "max restarts (0 = no restarts, −1 = unlimited)")
 	RunCmd.Flags().BoolVarP(&detach, "detach", "d", false, "run container in background")
+	RunCmd.Flags().BoolVarP(&interactive, "interactive", "i", false, "keep stdin open (forward host STDIN)")
+	RunCmd.Flags().BoolVarP(&tty, "tty", "t", false, "allocate a pseudo‑TTY (enabled by default)")
 	err := RunCmd.MarkFlagRequired("rootfs")
 	if err != nil {
 		return

@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"github.com/creack/pty"
 	"golang.org/x/sys/unix"
-	"io" // for io.Copy between PTY and pipe
+	"io"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -46,7 +46,7 @@ func SetupContainerRoot(rootfsPath string) error {
 
 // CloneAndRun clones the current process into new namespaces
 // then runs cmdPath with args inside the isolated environment
-func CloneAndRun(cmdPath string, args []string, rootfsPath string) (int, *os.File, *os.File, error) {
+func CloneAndRun(cmdPath string, args []string, rootfsPath string, interactive bool) (int, *os.File, *os.File, error) {
 	skipSetup := os.Getenv("SKIP_SETUP") == "1"
 	// Synchronization pipe: child waits on read until parent sets up networking
 	pr, pw, err := os.Pipe()
@@ -136,17 +136,21 @@ func CloneAndRun(cmdPath string, args []string, rootfsPath string) (int, *os.Fil
 	slave.Close()
 	pr.Close()
 
-	// Create a pipe and forward all data from the PTY master into it.
+	// If interactive mode – return the raw PTY master so the caller can both
+	// write (stdin) and read (stdout) from it.
+	if interactive {
+		return int(pid), master, pw, nil
+	}
+
+	// Non‑interactive: create a pipe so callers see clean EOF instead of EIO.
 	if rdr, wtr, errPipe := os.Pipe(); errPipe == nil {
 		go func() {
 			_, _ = io.Copy(wtr, master) // copy until PTY closes
 			master.Close()              // close original PTY master
 			wtr.Close()                 // signal EOF to readers
 		}()
-		// Return the pipe reader instead of the raw PTY master.
 		return int(pid), rdr, pw, nil
 	}
-
-	// Fallback: if the pipe could not be created, return the original PTY.
+	// Fallback
 	return int(pid), master, pw, nil
 }

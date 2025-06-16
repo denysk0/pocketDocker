@@ -84,13 +84,11 @@ func logsRun(cmd *cobra.Command, args []string) {
 		}
 		if err != nil {
 			if err == io.EOF {
-				// Сначала проверяем, не отменили ли мы уже контекст
 				select {
 				case <-ctx.Done():
 					return
 				default:
 				}
-				// Немного ждём перед новой попыткой
 				time.Sleep(50 * time.Millisecond)
 				continue
 			}
