@@ -11,6 +11,7 @@ bin/
 _build/
 pkg/
 /pocket-docker
+go.sum
 
 # Go modules
 vendor/
@@ -77,3 +78,4 @@ test-results.xml
 
 
 sync_to_ubuntu.sh
+*.tar
